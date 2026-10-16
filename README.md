@@ -1,6 +1,6 @@
-# sims1-legacy-4k-ui
+# sims1-legacy-hd-mod
 
-Goal: a crisp, native-resolution UI for **The Sims™ Legacy Collection** (The Sims 1, 2025 re-release) on 4K displays.
+Goal: a crisp, native-resolution UI for **The Sims™ Legacy Collection** (The Sims 1, 2025 re-release) on high-resolution displays (1440p, 4K).
 
 **Status: Phase 0 — feasibility spike.** Nothing here modifies the game yet.
 

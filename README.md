@@ -8,7 +8,7 @@ Goal: a crisp, native-resolution UI for **The Sims™ Legacy Collection** (The S
 
 The Legacy build auto-scales its 800×600-era UI to the desktop resolution. A 4K UI mod (upscaled assets + doubled layout coordinates) only works if the game can be forced to draw the UI at 1:1. The same blocker stopped [sims2-4k-ui-patch](https://github.com/lah7/sims2-4k-ui-patch) from supporting the Sims 2 Legacy release. Phase 0 exists to find out whether that switch exists for Sims 1 before investing more.
 
-Even if it works, only the **UI and text** become sharp. In-lot sprites (Sims, objects, walls) are fixed-resolution art and stay as they are.
+Order of work: **UI and text first** (phases 0–3), then in-lot graphics (phase 4). Sims themselves are real-time 3D with bitmap textures; objects, walls and floors are pre-rendered SPR2 sprites with color, alpha and z-buffer channels, which makes them the harder part.
 
 ## Layout
 

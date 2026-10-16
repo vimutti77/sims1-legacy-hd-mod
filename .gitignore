@@ -1,0 +1,19 @@
+# Never commit game data or anything extracted from it
+work/
+extracted/
+backup/
+*.far
+*.iff
+*.flr
+*.wll
+*.spr
+*.exe
+*.dll
+*.bmp
+*.tga
+*.uis
+
+# Python
+__pycache__/
+*.pyc
+.venv/

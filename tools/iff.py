@@ -1,8 +1,9 @@
-"""Chunk lister for The Sims 1 IFF files (IFF FILE 2.5).
+"""Chunk lister for The Sims 1 IFF files (IFF FILE 2.5, also 2.0).
 
 Layout (big-endian):
-    header: 60-byte signature "IFF FILE 2.5:TYPE FOLLOWING+SIZE\\0 JAMIE DOOLEY 2.0..."
+    header: 60-byte signature "IFF FILE 2.5:TYPE FOLLOWED BY SIZE\\0 JAMIE DOORNBOS & MAXIS 1"
             + u32 rsmp_offset                                  (64 bytes total)
+            (a few Legacy house files say "IFF FILE 2.0:" with the same layout)
     chunk:  4-byte type | u32 size (includes 76-byte header) | u16 id | u16 flags
             | 64-byte label (NUL padded) | data
 
@@ -20,7 +21,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-SIGNATURE_PREFIX = b"IFF FILE 2.5:TYPE FOLLOWING+SIZE"
+SIGNATURE_PREFIXES = (b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE", b"IFF FILE 2.0:TYPE FOLLOWED BY SIZE")
 HEADER_SIZE = 64
 CHUNK_HEADER_SIZE = 76
 
@@ -40,8 +41,8 @@ class IffError(ValueError):
 
 
 def read_iff(data: bytes) -> list[IffChunk]:
-    if not data.startswith(SIGNATURE_PREFIX):
-        raise IffError("not an IFF 2.5 file")
+    if not data.startswith(SIGNATURE_PREFIXES):
+        raise IffError("not an IFF 2.5/2.0 file")
     chunks = []
     pos = HEADER_SIZE
     while pos + CHUNK_HEADER_SIZE <= len(data):

@@ -30,8 +30,9 @@ def make_far(files: dict[str, bytes], name_len_fmt: str = "<I") -> bytes:
     return header + body + manifest
 
 
-def make_iff(chunks: list[tuple[str, int, str, bytes]]) -> bytes:
-    sig = b"IFF FILE 2.5:TYPE FOLLOWING+SIZE\0 JAMIE DOOLEY 2.0".ljust(60, b"\0")
+def make_iff(chunks: list[tuple[str, int, str, bytes]], version: bytes = b"2.5") -> bytes:
+    sig = b"IFF FILE " + version + b":TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1"
+    sig = sig.ljust(60, b"\0")
     out = sig + struct.pack(">I", 0)
     for ctype, cid, label, data in chunks:
         out += ctype.encode() + struct.pack(">IHH", 76 + len(data), cid, 0x10)
@@ -74,6 +75,13 @@ class IffTests(unittest.TestCase):
         self.assertEqual([(c.type, c.id, c.label, c.size) for c in chunks],
                          [("BMP_", 128, "panel", 12), ("STR#", 300, "labels", 4)])
         self.assertEqual(data[chunks[0].offset:chunks[0].offset + 2], b"BM")
+
+    def test_accepts_2_0_and_rejects_other_signatures(self):
+        chunk = [("STR#", 1, "x", b"\0" * 4)]
+        self.assertEqual(len(iff.read_iff(make_iff(chunk, b"2.0"))), 1)
+        bogus = b"IFF FILE 2.5:TYPE FOLLOWING+SIZE".ljust(64, b"\0")
+        with self.assertRaises(iff.IffError):
+            iff.read_iff(bogus)
 
     def test_bad_size(self):
         data = bytearray(make_iff([("BMP_", 1, "x", b"abc")]))

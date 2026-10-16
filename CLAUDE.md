@@ -25,16 +25,19 @@ Make **The Sims™ Legacy Collection** (The Sims 1, 2025 re-release, Steam) look
 - sims2-4k-ui-patch (lah7) is the reference project for Sims 2; Sims 2 Legacy exposes `uiScaleFactor` (cheat `uintProp uiScaleFactor 1|2|3`, and `Graphics Rules.sgr`).
 - Sims themselves are real-time 3D meshes with bitmap textures; objects/walls/floors are pre-rendered SPR2 sprites (color + alpha + z-buffer, 3 zoom levels). (From original-game knowledge; not yet checked.)
 
-## The open question now
+## Current approach (Phase 1)
 
-H4 is solved, but the Phase 1 plan ("2× bitmaps + 2× layout coordinates in data files") does not work as written, because the layout is not in data files (H1). Find out how the UI reaches the GPU before choosing one of these: Vulkan-level texture replacement, a pixel-art scaler for the UI layer, or patching layout code in memory. Details in `docs/FINDINGS.md`.
+The game draws each UI window (and each neighbourhood lot image) into its own 1× render target, then composites it onto the frame scaled ×s with a nearest sampler. Text comes from font atlases (1020×64, 1018×52, 1018×43) drawn as glyph quads; icons are 4-state sprite sheets.
+
+- `vkproxy/` is a drop-in 32-bit `vulkan-1.dll` (next to `Sims.exe`) that forwards to the real loader. Done: xBR on the UI-layer composite draws (works, user keeps it). User's chosen UI scale: 3× (Resolution `3840x2160`, no `-dpi`).
+- Next: (1) enlarge UI-layer render targets 3× inside the proxy (images, framebuffers, render area, viewport/scissor, clears, copies) so layout/input stay the same; (2) re-render the font atlases at 3× from a vector font; (3) per-texture xBR (later AI/hand-made) for icons.
+- Testing setup: `steam_appid.txt` (3314060) next to `Sims.exe` stops Steam relaunching the game, so it can be started directly (needed for RenderDoc and env vars). Don't send keystrokes while the user's editor has focus; use the proxy's trigger files (`xbr.toggle`, `trace.now` in `%VKPROXY_DIR%`).
 
 ## Next steps
 
-1. Capture one frame with RenderDoc at Resolution `3840x2160 (16:9)` + `-dpi:2`: are UI bitmaps separate textures drawn as quads, or one composited UI layer?
-2. Decide the Phase 1 approach from that (FINDINGS "ผลต่อแผน").
-3. Untested: setting `-dpi:2` in Steam Launch Options (only tested by running `Sims.exe -dpi:N`), `-maxaspect`, `-monitor`, `-skip_intro`, `-w`.
-4. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ".
+1. UI-layer enlargement in `vkproxy` (see above).
+2. Untested: setting launch options in Steam Launch Options (only tested by running `Sims.exe` directly), `-maxaspect`, `-monitor`, `-skip_intro`, `-w`.
+3. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
 
 Install folder: `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection` (app 3314060). Backups of it and of Saved Games are in `backup\`.
 

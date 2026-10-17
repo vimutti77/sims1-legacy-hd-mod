@@ -6,22 +6,24 @@
 // and observes rendering: it logs resource creation, dumps SPIR-V shaders and,
 // when F11 is pressed, logs every render pass and draw of the next frame.
 //
-// UI upscaling (option ข): the game draws each UI window into its own 1x
-// render target and composites it onto the frame with its textured-quad
-// pipeline and a nearest sampler. For every pipeline using that fragment
-// shader we create a twin that uses xbr.frag instead, and swap to the twin
-// for draws that sample a render target smaller than the current pass.
-// F10 toggles this at runtime; VKPROXY_XBR=0 starts with it off.
+// The game draws each UI window into its own 1x render target and composites
+// it onto the frame, scaled by its UI scale, with its textured-quad pipeline
+// and a nearest sampler. By default this DLL:
+// - creates those render targets UI-scale times larger and scales every pass
+//   into them, so UI is drawn at screen resolution (step 1b; readbacks such as
+//   lot thumbnails are shrunk back to 1x). VKPROXY_LAYER_SCALE=N forces N, 1 = off.
+// - replaces a sampled texture of w x h with <vkproxy\replace>\<w>x<h>@<scale>.bgra
+//   when that file exists (the HD font atlases); VKPROXY_REPLACE=0 disables this.
+// - draws every textured quad that is magnified (icons, the remaining 1x
+//   bitmaps) with xbr.frag instead of nearest: for each pipeline using the
+//   game's quad fragment shader we create a twin using xbr.frag. F10 toggles
+//   this at runtime; VKPROXY_XBR=0 starts with it off, VKPROXY_XBR_ALL=0 limits
+//   it to layer composites (option ข).
+// VKPROXY_DUMP=1 saves every texture upload to <VKPROXY_DIR>\dump.
 //
-// Experimental, off by default:
-// - VKPROXY_LAYER_SCALE=3: create UI layer render targets 3x larger and scale
-//   passes into them, so UI is drawn at screen resolution (step 1b).
-// - with it, <VKPROXY_DIR>\replace\<w>x<h>@3.bgra replaces a sampled texture of
-//   that size (the HD font atlases); VKPROXY_REPLACE=0 disables this.
-// - VKPROXY_XBR_ALL=1: xBR on every textured-quad draw, not only layer composites.
-// - VKPROXY_DUMP=1: save every texture upload to <VKPROXY_DIR>\dump.
-//
-// Output goes to %VKPROXY_DIR% (default %TEMP%\vkproxy).
+// Output goes to %VKPROXY_DIR% (default %TEMP%\vkproxy). Replacement files are
+// read from %VKPROXY_DIR%\replace if VKPROXY_DIR is set, else from
+// <folder of this DLL>\vkproxy\replace.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <windows.h>
@@ -30,9 +32,11 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -58,17 +62,20 @@ bool g_xbr_on = true;
 unsigned g_xbr_draws = 0;  // substituted draws in the current frame
 // Layer enlargement (step 1b): render targets smaller than the swapchain are
 // created g_layer_scale times larger, and passes into them are scaled to match,
-// so UI windows are rendered at screen resolution instead of 1x. Off (1) unless
-// VKPROXY_LAYER_SCALE is set, because a CPU readback of an enlarged target
-// (e.g. a thumbnail saved to disk) is not handled yet.
+// so UI windows are rendered at screen resolution instead of 1x. By default the
+// scale is the game's own UI scale (see auto_layer_scale), so a layer ends up
+// composited 1:1; VKPROXY_LAYER_SCALE=N forces N (1 = off).
 int g_layer_scale = 1;
+bool g_layer_scale_auto = true;
+int g_dpi_arg = 0;  // -dpi:N (or -dpi_N) on the game's command line, 0 if absent
 uint32_t g_swap_w = 0, g_swap_h = 0;
 bool g_dump = false;  // VKPROXY_DUMP=1: save texture uploads (see dump_upload)
 bool g_replace_on = true;  // VKPROXY_REPLACE=0 disables texture replacement
-bool g_xbr_all = false;    // VKPROXY_XBR_ALL=1: xBR on every UI quad (see xbr_twin_for)
+bool g_xbr_all = true;     // VKPROXY_XBR_ALL=0: xBR only on layer composites (see xbr_twin_for)
 // Texture replacement (step 2): a sampled B8G8R8A8 image of w x h is created
-// g_layer_scale times larger when <VKPROXY_DIR>\replace\<w>x<h>@<scale>.bgra
-// exists, and every upload into it is replaced by that file's pixels.
+// g_layer_scale times larger when <g_replace_dir>\<w>x<h>@<scale>.bgra exists,
+// and every upload into it is replaced by that file's pixels.
+std::string g_replace_dir;  // %VKPROXY_DIR%\replace if set, else <dll folder>\vkproxy\replace
 VkInstance g_instance = VK_NULL_HANDLE;
 VkPhysicalDevice g_phys = VK_NULL_HANDLE;
 VkDevice g_device = VK_NULL_HANDLE;
@@ -97,26 +104,52 @@ void logf(const char* fmt, ...) {
     fflush(g_log);
 }
 
+// N from "-dpi:N" or "-dpi_N" in the command line (the game's own syntax), else 0.
+int dpi_argument(const char* cmd) {
+    for (const char* p = cmd; (p = strchr(p, '-')) != nullptr; ++p)
+        if (!_strnicmp(p + 1, "dpi", 3) && (p[4] == ':' || p[4] == '_') && p[5] >= '0' && p[5] <= '9')
+            return atoi(p + 5);
+    return 0;
+}
+
+// Folder this DLL was loaded from (the game folder), without a trailing slash.
+std::string dll_folder() {
+    HMODULE self = nullptr;
+    char path[MAX_PATH];
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&dll_folder), &self) ||
+        !GetModuleFileNameA(self, path, MAX_PATH))
+        return ".";
+    std::string s = path;
+    return s.substr(0, s.find_last_of("\\/"));
+}
+
 void init() {
     static std::once_flag once;
     std::call_once(once, [] {
         char buf[MAX_PATH];
         DWORD n = GetEnvironmentVariableA("VKPROXY_DIR", buf, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) {
+        bool dir_set = n > 0 && n < MAX_PATH;
+        if (!dir_set) {
             GetTempPathA(MAX_PATH, buf);
             strcat(buf, "vkproxy");
         }
         g_dir = buf;
+        g_replace_dir = dir_set ? g_dir + "\\replace" : dll_folder() + "\\vkproxy\\replace";
         CreateDirectoryA(g_dir.c_str(), nullptr);
         g_log = fopen((g_dir + "\\vkproxy.log").c_str(), "w");
         if (GetEnvironmentVariableA("VKPROXY_XBR", buf, MAX_PATH) && buf[0] == '0') g_xbr_on = false;
-        if (GetEnvironmentVariableA("VKPROXY_LAYER_SCALE", buf, MAX_PATH)) g_layer_scale = atoi(buf);
-        if (g_layer_scale < 1 || g_layer_scale > 4) g_layer_scale = 1;
+        if (GetEnvironmentVariableA("VKPROXY_LAYER_SCALE", buf, MAX_PATH)) {
+            g_layer_scale = std::min(std::max(atoi(buf), 1), 4);
+            g_layer_scale_auto = false;
+        }
+        g_dpi_arg = dpi_argument(GetCommandLineA());
         if (GetEnvironmentVariableA("VKPROXY_DUMP", buf, MAX_PATH) && buf[0] == '1') g_dump = true;
         if (GetEnvironmentVariableA("VKPROXY_REPLACE", buf, MAX_PATH) && buf[0] == '0') g_replace_on = false;
-        if (GetEnvironmentVariableA("VKPROXY_XBR_ALL", buf, MAX_PATH) && buf[0] == '1') g_xbr_all = true;
-        logf("settings: xbr=%d xbr_all=%d layer_scale=%d replace=%d dump=%d", g_xbr_on, g_xbr_all, g_layer_scale,
-             g_replace_on, g_dump);
+        if (GetEnvironmentVariableA("VKPROXY_XBR_ALL", buf, MAX_PATH) && buf[0] == '0') g_xbr_all = false;
+        logf("settings: xbr=%d xbr_all=%d layer_scale=%s replace=%d (%s) dump=%d -dpi=%d", g_xbr_on, g_xbr_all,
+             g_layer_scale_auto ? "auto" : std::to_string(g_layer_scale).c_str(), g_replace_on,
+             g_replace_dir.c_str(), g_dump, g_dpi_arg);
         GetSystemDirectoryA(buf, MAX_PATH);  // SysWOW64 for a 32-bit process
         strcat(buf, "\\vulkan-1.dll");
         g_real = LoadLibraryA(buf);
@@ -169,6 +202,13 @@ std::unordered_map<VkCommandBuffer, CmdState> g_cmd;
 std::unordered_map<uint64_t, Replacement> g_replace;        // VkImage -> replacement pixels
 std::unordered_map<std::string, Staging> g_staging;         // replacement file -> staging buffer
 std::set<uint64_t> g_freed_replaced;                         // destroyed replaced images (to log reuse)
+// 1x images that readbacks of enlarged images are shrunk into, one per size and
+// format (readbacks are rare: lot thumbnails when saving).
+struct Readback {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+};
+std::map<std::tuple<uint32_t, uint32_t, VkFormat>, Readback> g_readback;
 // Upload dumping (VKPROXY_DUMP=1): where each buffer's bytes are mapped, so the
 // pixels of a texture upload can be read when the copy is recorded.
 struct BufMem {
@@ -259,8 +299,8 @@ std::string replacement_for(const VkImageCreateInfo* ci) {
         ci->mipLevels != 1 || ci->arrayLayers != 1)
         return "";
     char name[64];
-    snprintf(name, sizeof name, "\\replace\\%ux%u@%d.bgra", ci->extent.width, ci->extent.height, g_layer_scale);
-    std::string path = g_dir + name;
+    snprintf(name, sizeof name, "\\%ux%u@%d.bgra", ci->extent.width, ci->extent.height, g_layer_scale);
+    std::string path = g_replace_dir + name;
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) return "";
     uint64_t want = 4ull * ci->extent.width * ci->extent.height * g_layer_scale * g_layer_scale;
@@ -646,11 +686,10 @@ void trace_draw(VkCommandBuffer cb, const char* kind, uint32_t count) {
 }
 
 // The xBR twin to use for the next draw on cb, or VK_NULL_HANDLE.
-// Default (stable): only draws that composite a UI layer, i.e. sample a render
+// Default: every draw through a UI quad pipeline; the shader passes texels
+// through when the quad is drawn at about 1:1 (HD atlases, enlarged layers).
+// VKPROXY_XBR_ALL=0: only draws that composite a UI layer, i.e. sample a render
 // target smaller than the pass being drawn into.
-// VKPROXY_XBR_ALL=1 (experimental, linked to GPU faults together with layer
-// enlargement): every draw through a UI quad pipeline; the shader passes texels
-// through when the quad is drawn at about 1:1.
 VkPipeline xbr_twin_for(VkCommandBuffer cb, VkPipeline* original) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     if (!g_xbr_on) return VK_NULL_HANDLE;
@@ -816,22 +855,6 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBlitImage(VkCommandBuffer cb, VkImage src, Vk
     real_vkCmdBlitImage(cb, src, sl, dst, dl, n, r, f);
 }
 
-VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout sl,
-                                                     VkBuffer dst, uint32_t n, const VkBufferImageCopy* r) {
-    {
-        std::lock_guard<std::recursive_mutex> lk(g_mu);
-        // Always logged: a readback of a UI layer would break if the layer is enlarged.
-        static unsigned count = 0;
-        if (g_trace || count < 20) {
-            ++count;
-            logf("    copyImageToBuffer %s %u regions, first %ux%u (frame %u)", img_desc((uint64_t)src).c_str(), n,
-                 n ? r[0].imageExtent.width : 0, n ? r[0].imageExtent.height : 0, g_frame);
-        }
-        warn_if_enlarged("copyImageToBuffer src", (uint64_t)src);
-    }
-    real_vkCmdCopyImageToBuffer(cb, src, sl, dst, n, r);
-}
-
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
     VkResult r = real_vkBindBufferMemory(d, b, m, off);
     if (r == VK_SUCCESS && g_dump) {
@@ -895,6 +918,18 @@ void dump_upload(VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy*
 
 PFN_vkVoidFunction device_fn(const char* name) { return real_GDPA(g_device, name); }
 
+// First memory type allowed by `bits` that has all of `want`, or UINT32_MAX.
+uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    auto mem_props = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+        real_GIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties"));
+    if (!mem_props) return UINT32_MAX;
+    VkPhysicalDeviceMemoryProperties props;
+    mem_props(g_phys, &props);
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+        if ((bits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) return i;
+    return UINT32_MAX;
+}
+
 void free_staging(Staging& s) {
     auto destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(device_fn("vkDestroyBuffer"));
     auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(device_fn("vkFreeMemory"));
@@ -915,9 +950,7 @@ VkBuffer staging_for(const Replacement& rp) {
     auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(device_fn("vkAllocateMemory"));
     auto bind = reinterpret_cast<PFN_vkBindBufferMemory>(device_fn("vkBindBufferMemory"));
     auto map = reinterpret_cast<PFN_vkMapMemory>(device_fn("vkMapMemory"));
-    auto mem_props = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
-        real_GIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties"));
-    if (!create_buffer || !requirements || !allocate || !bind || !map || !mem_props) return VK_NULL_HANDLE;
+    if (!create_buffer || !requirements || !allocate || !bind || !map) return VK_NULL_HANDLE;
 
     VkDeviceSize size = 4ull * rp.w * rp.h;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -929,15 +962,8 @@ VkBuffer staging_for(const Replacement& rp) {
     }
     VkMemoryRequirements req;
     requirements(g_device, st.buffer, &req);
-    VkPhysicalDeviceMemoryProperties props;
-    mem_props(g_phys, &props);
-    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
-        if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) {
-            type = i;
-            break;
-        }
+    uint32_t type = memory_type(req.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = type;
@@ -985,12 +1011,132 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffe
     real_vkCmdCopyBufferToImage(cb, src, dst, dl, n, r);
 }
 
+void free_readback(Readback& rb) {
+    auto destroy_image = reinterpret_cast<PFN_vkDestroyImage>(device_fn("vkDestroyImage"));
+    auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(device_fn("vkFreeMemory"));
+    if (rb.image && destroy_image) destroy_image(g_device, rb.image, nullptr);
+    if (rb.memory && free_memory) free_memory(g_device, rb.memory, nullptr);
+    rb = Readback{};
+}
+
+// A 1x image of the game's size for a readback of an enlarged image, or null.
+VkImage readback_image(const ImageInfo& info) {
+    auto key = std::make_tuple(info.w, info.h, info.format);
+    auto cached = g_readback.find(key);
+    if (cached != g_readback.end()) return cached->second.image;
+    Readback& rb = g_readback[key];
+    auto requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(device_fn("vkGetImageMemoryRequirements"));
+    auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(device_fn("vkAllocateMemory"));
+    auto bind = reinterpret_cast<PFN_vkBindImageMemory>(device_fn("vkBindImageMemory"));
+    auto format_props = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+        real_GIPA(g_instance, "vkGetPhysicalDeviceFormatProperties"));
+    if (!requirements || !allocate || !bind || !format_props || !real_vkCmdBlitImage ||
+        !device_fn("vkCmdPipelineBarrier"))
+        return VK_NULL_HANDLE;
+    VkFormatProperties fp;
+    format_props(g_phys, info.format, &fp);
+    const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((fp.optimalTilingFeatures & blit) != blit) return VK_NULL_HANDLE;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = info.format;
+    ci.extent = {info.w, info.h, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (real_vkCreateImage(g_device, &ci, nullptr, &rb.image) != VK_SUCCESS) {  // the real one: never enlarged
+        rb.image = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    VkMemoryRequirements req;
+    requirements(g_device, rb.image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = memory_type(req.memoryTypeBits, 0);
+    if (ai.memoryTypeIndex == UINT32_MAX || allocate(g_device, &ai, nullptr, &rb.memory) != VK_SUCCESS ||
+        bind(g_device, rb.image, rb.memory, 0) != VK_SUCCESS) {
+        free_readback(rb);
+        return VK_NULL_HANDLE;
+    }
+    logf("readback: made %ux%u fmt%d image for shrinking enlarged readbacks", info.w, info.h,
+         static_cast<int>(info.format));
+    return rb.image;
+}
+
+// Shrink enlarged `src` (scale s) into the 1x image `small` and leave it in
+// TRANSFER_SRC_OPTIMAL. Nearest: each 1x pixel takes the centre of its s x s
+// block, which is what the game would have drawn at 1x.
+void shrink_into(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage small, const ImageInfo& info) {
+    auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(device_fn("vkCmdPipelineBarrier"));
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;  // the previous readback through this image
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = small;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {static_cast<int32_t>(info.w * info.scale), static_cast<int32_t>(info.h * info.scale), 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[1] = {static_cast<int32_t>(info.w), static_cast<int32_t>(info.h), 1};
+    real_vkCmdBlitImage(cb, src, sl, small, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// The game reads some render targets back to the CPU (lot thumbnails when
+// saving). Those targets are enlarged like UI layers, so read from a 1x copy.
+VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout sl,
+                                                     VkBuffer dst, uint32_t n, const VkBufferImageCopy* r) {
+    VkImage small = VK_NULL_HANDLE;
+    ImageInfo info{};
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        static unsigned count = 0;
+        if (g_trace || count < 20) {
+            ++count;
+            logf("    copyImageToBuffer %s %u regions, first %ux%u (frame %u)", img_desc((uint64_t)src).c_str(), n,
+                 n ? r[0].imageExtent.width : 0, n ? r[0].imageExtent.height : 0, g_frame);
+        }
+        auto im = g_images.find((uint64_t)src);
+        if (im != g_images.end() && im->second.scale > 1) {
+            info = im->second;
+            bool plain = true;  // color, mip 0, layer 0 only
+            for (uint32_t i = 0; i < n; ++i) {
+                const VkImageSubresourceLayers& s = r[i].imageSubresource;
+                if (s.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || s.mipLevel || s.baseArrayLayer || s.layerCount != 1)
+                    plain = false;
+            }
+            if (plain) small = readback_image(info);
+            if (!small) warn_if_enlarged("copyImageToBuffer src", (uint64_t)src);
+        }
+    }
+    if (small) {
+        shrink_into(cb, src, sl, small, info);
+        real_vkCmdCopyImageToBuffer(cb, small, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, n, r);
+        return;
+    }
+    real_vkCmdCopyImageToBuffer(cb, src, sl, dst, n, r);
+}
+
 // Free what the proxy created on this device before the game destroys it.
 VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCallbacks* a) {
     if (d && d == g_device) {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         for (auto& s : g_staging) free_staging(s.second);
         g_staging.clear();
+        for (auto& rb : g_readback) free_readback(rb.second);
+        g_readback.clear();
         auto destroy_pipeline = reinterpret_cast<PFN_vkDestroyPipeline>(device_fn("vkDestroyPipeline"));
         auto destroy_module = reinterpret_cast<PFN_vkDestroyShaderModule>(device_fn("vkDestroyShaderModule"));
         for (auto& t : g_xbr_twin)
@@ -1020,6 +1166,12 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateSwapchainKHR(VkDevice d, const VkSwapc
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         g_swap_w = ci->imageExtent.width;
         g_swap_h = ci->imageExtent.height;
+        // The game's UI scale: height / 600, lowered by -dpi:N (FINDINGS, H4).
+        if (g_layer_scale_auto) {
+            int s = std::max(1, static_cast<int>(g_swap_h / 600));
+            if (g_dpi_arg > 0) s = std::min(s, g_dpi_arg);
+            g_layer_scale = std::min(s, 4);
+        }
     }
     logf("createSwapchain %ux%u fmt%d images>=%u (layer scale %d)", ci->imageExtent.width, ci->imageExtent.height,
          static_cast<int>(ci->imageFormat), ci->minImageCount, g_layer_scale);

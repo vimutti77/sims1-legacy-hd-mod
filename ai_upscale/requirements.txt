@@ -1,0 +1,6 @@
+# PyTorch with CUDA: install from the PyTorch index first, e.g. for CUDA 12.8 (RTX 50xx needs >= 12.8):
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+spandrel>=0.4.2
+numpy
+pillow

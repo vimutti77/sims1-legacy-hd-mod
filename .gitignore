@@ -16,6 +16,9 @@ backup/
 # Build output
 vkproxy/build/
 
+# Downloaded AI models
+ai_upscale/models/
+
 # Python
 __pycache__/
 *.pyc

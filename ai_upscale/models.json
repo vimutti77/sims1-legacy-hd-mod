@@ -1,0 +1,35 @@
+{
+  "_comment": "Upscaling models for ai_upscale/upscale.py. Any model spandrel can load works; add an entry here or pass a file path to --model. sha256 is checked after download.",
+  "ultrasharp-v2": {
+    "file": "4x-UltraSharpV2.safetensors",
+    "url": "https://huggingface.co/Kim2091/UltraSharpV2/resolve/main/4x-UltraSharpV2.safetensors",
+    "sha256": "2b5db674aa8f3864a696dccd1d07d7cc0500fbf220f35044cd30eee9a7f971a7",
+    "arch": "DAT2", "scale": 4,
+    "license": "CC BY-NC-SA 4.0",
+    "note": "Default. Sharpest of the ones compared, faithful on objects, faces and catalogue pictures; adds some detail of its own (e.g. stained glass)."
+  },
+  "pbrify-v4": {
+    "file": "4x-PBRify_UpscalerV4.safetensors",
+    "url": "https://github.com/Kim2091/Kim2091-Models/releases/download/4x-PBRify_UpscalerV4/4x-PBRify_UpscalerV4.safetensors",
+    "sha256": "a00fa50116895a9b766aeb012edad0a14d66f3afda65539efc0f6fc28c991ba2",
+    "arch": "DAT2", "scale": 4,
+    "license": "CC0 1.0",
+    "note": "Trained on 2000s game textures; natural wood/foliage, slightly softer than UltraSharp. No licence conditions."
+  },
+  "drct-mssim": {
+    "file": "4xmssim_drct-l_pretrain.pth",
+    "url": "https://github.com/Phhofm/models/releases/download/4xDRCT-mssim-pretrains/4xmssim_drct-l_pretrain.pth",
+    "sha256": "04df5f37eb8aaf2607662073a7918c6ccd244b9e2904434ef882abe431cf8861",
+    "arch": "DRCT-L", "scale": 4,
+    "license": "CC BY 4.0",
+    "note": "No GAN: invents nothing, but soft. Runs in fp32 (no bf16 support in some ops)."
+  },
+  "x4plus": {
+    "file": "RealESRGAN_x4plus.pth",
+    "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+    "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+    "arch": "ESRGAN", "scale": 4,
+    "license": "BSD-3-Clause",
+    "note": "2021 baseline; painterly, invents bright grout lines on tiles."
+  }
+}

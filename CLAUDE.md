@@ -46,11 +46,12 @@ Testing notes:
 
 ## Next steps
 
-1. Shadow fonts `_11_s`, `_11_bs`, `_12_bs`, `_14_bs` (and `_48`): find where the game uses them (none seen in traces yet), then extend `font_atlas.py` (bold + shadow).
-2. HD icons: dump uploads (`VKPROXY_DUMP=1`), upscale (AI or redraw), replace by content hash instead of size.
-3. Phase 4 (in-lot world): xBR twins for the world shaders or sprite replacement; shader notes in FINDINGS.
-4. Untested: Steam Launch Options, `-maxaspect`, `-monitor`, `-skip_intro`, `-w`; other resolutions (1440p → s = 2, needs `--scale 2` atlases).
-5. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
+1. HD object sprites, part by part: `py tools\hd_art.py --game <dir> --category <cat> --install`, then the user reviews in game (F9 toggles HD). Done: base/seating. Rules learnt (FINDINGS "sprite ของ object แบบ HD"): coverage must never exceed the original (1x z-buffer textures → leaks through walls), so the AI's alpha is unused and outlines stay stepped; smooth outlines need HD z-buffer twins too.
+2. Floors (`floors.iff`): upscale with neighbouring tiles as context so tiles stay seamless.
+3. Catalogue thumbnails (74x37): build from the HD sprite instead of upscaling the 37x37 picture.
+4. HD icons: dump uploads (`VKPROXY_DUMP=1`), upscale, replace by content hash (same mechanism as sprites).
+3. Untested: Steam Launch Options, `-maxaspect`, `-monitor`, `-skip_intro`, `-w`; other resolutions (1440p → s = 2, needs `--scale 2` atlases); Polish/Russian fonts (`Fonts\<lang>\`, not built yet).
+4. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
 
 Install folder: `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection` (app 3314060). Backups of it and of Saved Games are in `backup\`.
 

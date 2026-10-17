@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -15,7 +16,9 @@ import far  # noqa: E402
 import ffn  # noqa: E402
 import font_atlas  # noqa: E402
 import iff  # noqa: E402
+import hd_composite  # noqa: E402
 import inventory  # noqa: E402
+import spr2  # noqa: E402
 
 
 def make_far(files: dict[str, bytes], name_len_fmt: str = "<I") -> bytes:
@@ -139,6 +142,125 @@ class FontAtlasTests(unittest.TestCase):
         self.assertIsNotNone(ink.bbox())
         self.assertGreater(ink.ascent, 0)
         self.assertGreater(len(set(ink.cov)), 17)  # more grey levels than GDI's 4x4 anti-aliasing
+
+
+def spr2_frame_body() -> bytes:
+    """A 3x3 frame: row 0 = colour 1, colour 2, gap; row 1 skipped;
+    row 2 = colour 3 at alpha 10, colour 1 with z, gap."""
+    def run(cmd, n, payload=b""):
+        return struct.pack("<H", cmd << 13 | n) + payload
+
+    row0 = run(6, 2, bytes([1, 2])) + run(3, 1)
+    row2 = run(2, 1, bytes([0, 3, 10, 0])) + run(1, 1, bytes([0, 1]))  # (z, colour, alpha) padded
+    rows = run(0, 2 + len(row0), row0) + run(4, 1) + run(0, 2 + len(row2), row2) + run(5, 0)
+    return struct.pack("<HHIHHHH", 3, 3, 7, 1, 0, 0, 0) + rows
+
+
+def make_spr2(version: int) -> bytes:
+    body = spr2_frame_body()
+    if version == 1000:
+        return struct.pack("<IIII", 1000, 1, 1, 16) + body
+    return struct.pack("<IIIII", 1001, 1, 1, 1001, len(body)) + body
+
+
+PALETTE = [(0, 0, 0), (255, 255, 255), (100, 150, 200), (84, 10, 10)]
+
+
+class Spr2Tests(unittest.TestCase):
+    EXPECTED = bytes([248, 252, 248, 255, 200, 148, 96, 255, 0, 0, 0, 0] + [0] * 12
+                     # colour 3 (84, 10, 10) at alpha 80: 565, premultiplied, 565 again
+                     + [0, 0, 24, 80, 248, 252, 248, 255, 0, 0, 0, 0])
+
+    def test_both_versions_decode_to_the_game_texture(self):
+        for version in (1000, 1001):
+            data = make_spr2(version)
+            (off, pal), = spr2.frame_offsets(data)
+            frame = spr2.decode_frame(data, off)
+            self.assertEqual((frame.w, frame.h, pal), (3, 3, 1))
+            self.assertEqual(spr2.game_texture(frame, PALETTE), self.EXPECTED)
+
+    def test_content_name(self):
+        self.assertEqual(spr2.content_name(1, 1, b""), "1x1_14650fb0739d0383")  # vkproxy's offset basis
+        self.assertRegex(spr2.content_name(3, 3, self.EXPECTED), r"^3x3_[0-9a-f]{16}$")
+
+    def test_game_textures_reads_an_iff(self):
+        palt = struct.pack("<II", 1, len(PALETTE)) + b"\0" * 8 + bytes(c for rgb in PALETTE for c in rgb)
+        data = make_iff([("PALT", 1, "pal", palt), ("SPR2", 100, "sprite", make_spr2(1000))])
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp, "obj.iff")
+            p.write_bytes(data)
+            (name, w, h, tex, where), = spr2.game_textures(p)
+        self.assertEqual((w, h, tex), (3, 3, self.EXPECTED))
+        self.assertEqual(name, spr2.content_name(3, 3, self.EXPECTED))
+        self.assertIn("SPR2#100", where)
+
+    def test_rejects_broken_data(self):
+        with self.assertRaises(spr2.Spr2Error):
+            spr2.frame_offsets(b"\x00\x01")
+        with self.assertRaises(spr2.Spr2Error):
+            spr2.frame_offsets(struct.pack("<III", 999, 0, 0))
+        broken = bytearray(make_spr2(1000))
+        struct.pack_into("<H", broken, 16 + 16 + 2, 6 << 13 | 200)  # a 200-pixel run in a short row
+        with self.assertRaises(spr2.Spr2Error):
+            spr2.decode_frame(bytes(broken), 16)
+
+
+class HdCompositeTests(unittest.TestCase):
+    def test_png_roundtrip_and_filtered_rows(self):
+        rgba = bytes(range(2 * 2 * 4))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp, "a.png")
+            hd_composite.write_png(p, 2, 2, rgba)
+            self.assertEqual(hd_composite.read_png(p), (2, 2, bytearray(rgba)))
+            # same pixels, rows stored with the Sub (1) and Up (2) filters
+            r0, r1 = rgba[:8], rgba[8:]
+            sub0 = r0[:4] + bytes((r0[4 + i] - r0[i]) & 255 for i in range(4))
+            up1 = bytes((r1[i] - r0[i]) & 255 for i in range(8))
+            raw = b"\x01" + sub0 + b"\x02" + up1
+            ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)
+
+            def chunk(t, d):
+                return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+
+            p.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+            self.assertEqual(hd_composite.read_png(p)[2], bytearray(rgba))
+
+    def test_to_straight(self):
+        self.assertEqual(hd_composite.to_straight(bytes([10, 20, 30, 128, 1, 2, 3, 255, 9, 9, 9, 0])),
+                         bytearray([60, 40, 20, 128, 3, 2, 1, 255, 9, 9, 9, 0]))
+
+    def test_mirror_fill_reflects_across_the_edge(self):
+        # one row: two solid pixels (red, green) then three transparent ones
+        row = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
+        out = hd_composite.mirror_fill(5, 1, bytearray(b for px in row for b in px))
+        colours = [tuple(out[i * 4:i * 4 + 3]) for i in range(5)]
+        # x=2 mirrors x=0 across x=1; beyond the picture the nearest solid colour is used
+        self.assertEqual(colours, [(255, 0, 0), (0, 255, 0), (255, 0, 0), (0, 255, 0), (0, 255, 0)])
+        self.assertEqual([out[i * 4 + 3] for i in range(5)], [255, 255, 0, 0, 0])  # alpha untouched
+
+    def test_composite_keeps_coverage_and_takes_colour_inside(self):
+        # 3x1 original (premultiplied BGRA): opaque, opaque, transparent
+        orig = bytes([10, 20, 30, 255, 10, 20, 30, 255, 0, 0, 0, 0])
+        ai3 = bytes([200, 100, 50, 255] * 9 * 3)  # upscaler says: a different colour, opaque everywhere
+        out = hd_composite.composite(3, 1, orig, ai3)
+        px = [tuple(out[i * 4:i * 4 + 4]) for i in range(9 * 3)]
+        for y in range(3):
+            row = px[y * 9:(y + 1) * 9]
+            self.assertEqual(row[:6], [(50, 100, 200, 255)] * 6)  # AI colour, as BGRA, inside
+            self.assertEqual(row[6:], [(0, 0, 0, 0)] * 3)  # never more coverage than the original
+
+    def test_composite_samples_soft_areas_from_the_original(self):
+        orig = bytes([0, 0, 0, 128, 0, 0, 0, 128])  # a 2x1 half-transparent shadow
+        out = hd_composite.composite(2, 1, orig, bytes([255] * 6 * 3 * 4))
+        self.assertTrue(all(out[i * 4:i * 4 + 4] == bytes([0, 0, 0, 128]) for i in range(18)))
+
+    def test_shrink_is_an_area_average(self):
+        # 4x1 -> 3x1: half red, half blue
+        src = bytes([255, 0, 0, 255] * 2 + [0, 0, 255, 255] * 2)
+        out = hd_composite.shrink(4, 1, src, 3, 1)
+        self.assertEqual(out[0:4], bytearray([255, 0, 0, 255]))
+        self.assertTrue(all(abs(a - b) <= 1 for a, b in zip(out[4:8], [128, 0, 128, 255])), out[4:8])  # 50/50
+        self.assertEqual(out[8:12], bytearray([0, 0, 255, 255]))
 
 
 class FarTests(unittest.TestCase):

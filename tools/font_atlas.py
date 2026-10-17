@@ -16,8 +16,9 @@ cells) and redraws every glyph `scale` times larger from a vector font
 
 Pixels are written as premultiplied white (b = g = r = a = coverage).
 
-Only the plain fonts are built; the shadow variants (_s, _bs) and size 48 are
-skipped, as are the per-language folders (Fonts/Polish, ...). Rendering needs
+Only the plain fonts are built: Legacy never loads the shadow variants (_s, _bs)
+or size 48 (it draws shadowed text twice instead). The per-language folders
+(Fonts/Polish, Fonts/Russian) are not built yet. Rendering needs
 Windows (gdi32) and the Comic Sans MS font.
 
 Usage:

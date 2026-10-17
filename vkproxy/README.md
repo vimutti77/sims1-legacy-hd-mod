@@ -58,7 +58,8 @@ Environment variables, for testing (set before starting `Sims.exe` directly; nee
 
 ## Limits
 
-- Only UI is affected; the in-lot world is untouched.
+- In the lot, only textures with a content-replacement file change (object sprites);
+  floors, walls and Sims are drawn as the game made them.
 - xBR smooths edges but adds no detail (see FINDINGS).
 - Readbacks of enlarged targets are handled for `vkCmdCopyImageToBuffer` (lot thumbnails);
   `vkCmdCopyImage`/`vkCmdBlitImage` from them are only logged (not seen so far).

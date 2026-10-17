@@ -10,7 +10,8 @@ Make **The Sims™ Legacy Collection** (The Sims 1, 2025 re-release, Steam) look
 
 - **Phase 0 done (2026-10-17). Results: `docs/FINDINGS.md`.** H2, H3, H4 true; H1 probably false (no layout data found).
 - **Phase 1 works and is in daily use (2026-10-17)**: `vkproxy/` draws UI windows at screen resolution, swaps in HD font atlases and xBRs the remaining bitmaps; plain Steam launch, saving works. Details and the bugs found on the way: FINDINGS "Phase 1".
-- `tools/`: `far.py`, `iff.py`, `inventory.py`, `exe_strings.py`, `ffn.py` (font reader), `font_atlas.py` (builds the HD atlases from the user's install). 15 tests pass (`py -m unittest discover -s tests`; on this machine `python` is the Store alias, use `py`).
+- **HD object sprites installed for the whole game (2026-10-17)**: base, ep1–ep7, deluxe, shared = 85,753 files, 11.5 GB in `<game>\vkproxy\replace`, made by `tools/hd_art.py` with UltraSharp V2 (~2 h on the RTX 5090). Base/seating reviewed in game; the rest awaits the user's review (F9).
+- `tools/`: `far.py`, `iff.py`, `inventory.py`, `exe_strings.py`, `ffn.py` (font reader), `font_atlas.py` (builds the HD atlases from the user's install), `spr2.py`, `hd_composite.py`, `hd_art.py` (HD sprites); AI step in `ai_upscale/`. 25 tests pass (`py -m unittest discover -s tests`; on this machine `python` is the Store alias, use `py`).
 - `launcher/` (display-mode switcher) is superseded by in-game Resolution + vkproxy; never tested on Windows.
 
 ## Key facts gathered so far
@@ -46,12 +47,12 @@ Testing notes:
 
 ## Next steps
 
-1. HD object sprites, part by part: `py tools\hd_art.py --game <dir> --category <cat> --install`, then the user reviews in game (F9 toggles HD). Done: base/seating. Rules learnt (FINDINGS "sprite ของ object แบบ HD"): coverage must never exceed the original (1x z-buffer textures → leaks through walls), so the AI's alpha is unused and outlines stay stepped; smooth outlines need HD z-buffer twins too.
+1. HD object sprites, part by part: `py tools\hd_art.py --game <dir> --pack <pack> --category <cat> --install --clean`, then the user reviews in game (F9 toggles HD). All parts built and installed; reviewed: base/seating. G: has only ~6 GB free: `work\hd_art\hd` duplicates the installed files and can go if space is needed. Rules learnt (FINDINGS "sprite ของ object แบบ HD"): coverage must never exceed the original (1x z-buffer textures → leaks through walls), so the AI's alpha is unused and outlines stay stepped; smooth outlines need HD z-buffer twins too.
 2. Floors (`floors.iff`): upscale with neighbouring tiles as context so tiles stay seamless.
 3. Catalogue thumbnails (74x37): build from the HD sprite instead of upscaling the 37x37 picture.
 4. HD icons: dump uploads (`VKPROXY_DUMP=1`), upscale, replace by content hash (same mechanism as sprites).
-3. Untested: Steam Launch Options, `-maxaspect`, `-monitor`, `-skip_intro`, `-w`; other resolutions (1440p → s = 2, needs `--scale 2` atlases); Polish/Russian fonts (`Fonts\<lang>\`, not built yet).
-4. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
+5. Untested: Steam Launch Options, `-maxaspect`, `-monitor`, `-skip_intro`, `-w`; other resolutions (1440p → s = 2, needs `--scale 2` atlases); Polish/Russian fonts (`Fonts\<lang>\`, not built yet).
+6. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
 
 Install folder: `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection` (app 3314060). Backups of it and of Saved Games are in `backup\`.
 

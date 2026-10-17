@@ -7,6 +7,8 @@ Steps, each skipping work already done (so parts and interrupted runs resume):
   upscale    ai_upscale/upscale.py --model M -> <work>/ai/<M>/        (needs the venv)
   composite  -> <work>/hd/<M>/<name>@3.bgra                            (hd_composite)
   install    copy the part's files into <game>/vkproxy/replace/  (--install)
+With --clean the part's AI outputs are deleted once composited (they are the
+largest intermediates; keep them only to re-run the composite step).
 
 A part is a category of objects within a pack:
   --pack      base | ep1 ... ep7 | deluxe | shared   (default base)
@@ -19,7 +21,7 @@ their own treatment.
 
 Usage:
     py tools/hd_art.py --game <dir> --list                    frames per category
-    py tools/hd_art.py --game <dir> --category seating [--model ultrasharp-v2] [--install]
+    py tools/hd_art.py --game <dir> --category seating [--model ultrasharp-v2] [--install] [--clean]
 Close the game before running: the upscaler uses the GPU.
 """
 from __future__ import annotations
@@ -128,6 +130,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--python", type=Path, default=REPO / "work" / "ext" / "torch" / "Scripts" / "python.exe",
                     help="python of the ai_upscale venv")
     ap.add_argument("--install", action="store_true", help="copy the part's HD files into <game>/vkproxy/replace")
+    ap.add_argument("--clean", action="store_true",
+                    help="delete the part's AI outputs once composited (large; only needed to re-composite)")
     ap.add_argument("--list", action="store_true", help="frames per category in the pack, then exit")
     args = ap.parse_args(argv)
 
@@ -174,7 +178,7 @@ def main(argv: list[str]) -> int:
     print(f"prep: {hd_composite.run_all(jobs, hd_composite.prep_one)} new")
 
     # 3. upscale (only this part's images)
-    todo = [n for n in names if not (ai / f"{n}.png").exists()]
+    todo = [n for n in names if not (ai / f"{n}.png").exists() and not (hd / f"{n}@3.bgra").exists()]
     if todo:
         if game_running():
             print("The game is running: close it before upscaling (GPU).")
@@ -196,6 +200,13 @@ def main(argv: list[str]) -> int:
     jobs = [(orig / f"{n}.bgra", ai / f"{n}.png", hd / f"{n}@3.bgra") for n in names
             if (ai / f"{n}.png").exists() and not (hd / f"{n}@3.bgra").exists()]
     print(f"composite: {hd_composite.run_all(jobs, hd_composite.composite_one)} new")
+    if args.clean:
+        n = 0
+        for name in names:
+            if (hd / f"{name}@3.bgra").exists() and (ai / f"{name}.png").exists():
+                (ai / f"{name}.png").unlink()
+                n += 1
+        print(f"clean: removed {n} AI outputs")
 
     # 5. install
     if args.install:

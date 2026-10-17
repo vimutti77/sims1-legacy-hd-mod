@@ -59,6 +59,7 @@ PFN_vkCreateDevice real_CreateDevice = nullptr;
 unsigned g_frame = 0;
 bool g_trace = false;  // log draws until the next present
 bool g_xbr_on = true;
+bool g_hd_on = true;  // F9 / hd.toggle: draw with HD twins (content replacement)
 unsigned g_xbr_draws = 0;  // substituted draws in the current frame
 // Layer enlargement (step 1b): render targets smaller than the swapchain are
 // created g_layer_scale times larger, and passes into them are scaled to match,
@@ -188,6 +189,7 @@ struct CmdState {
     VkRect2D area{};                // render area of the current pass (as issued)
     std::vector<VkViewport> viewports;  // as last set by the game (unscaled)
     std::vector<VkRect2D> scissors;
+    uint64_t layout0 = 0;               // pipeline layout the game last bound set 0 with
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -209,6 +211,26 @@ struct Readback {
     VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 std::map<std::tuple<uint32_t, uint32_t, VkFormat>, Readback> g_readback;
+// Content replacement (HD art for icons and object pictures): when the pixels
+// uploaded into a sampled w x h texture hash to H and <replace>\<w>x<h>_<H>@<s>.bgra
+// exists, the proxy keeps an s-times larger twin image with those pixels, and
+// draws that sample the texture bind a descriptor set pointing at the twin.
+// The game's own image is left alone; textures without a file keep xBR.
+struct HdImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    std::string name;
+};
+std::unordered_map<uint64_t, HdImage> g_hd;               // game VkImage -> HD twin
+std::vector<HdImage> g_hd_retired;                         // replaced by a re-upload; freed with the device
+std::set<std::string> g_hd_names;                          // "<w>x<h>_<hash>" with a file
+std::set<std::pair<uint32_t, uint32_t>> g_hd_sizes;        // sizes worth hashing
+bool g_hd_scanned = false;
+std::unordered_map<uint64_t, bool> g_dsl_single;           // VkDescriptorSetLayout -> only binding 0, one sampler
+std::unordered_map<uint64_t, uint64_t> g_set_layout;       // VkDescriptorSet -> its layout
+std::map<std::tuple<uint64_t, uint64_t, uint64_t>, VkDescriptorSet> g_hd_sets;  // (view, sampler, layout) -> set
+VkDescriptorPool g_hd_pool = VK_NULL_HANDLE;
 // Upload dumping (VKPROXY_DUMP=1): where each buffer's bytes are mapped, so the
 // pixels of a texture upload can be read when the copy is recorded.
 struct BufMem {
@@ -258,6 +280,8 @@ const char* filter_name(VkFilter f) { return f == VK_FILTER_NEAREST ? "nearest" 
     X(vkCreateShaderModule)                                                                    \
     X(vkCreateGraphicsPipelines)                                                               \
     X(vkUpdateDescriptorSets)                                                                  \
+    X(vkCreateDescriptorSetLayout)                                                             \
+    X(vkAllocateDescriptorSets)                                                                \
     X(vkCmdBeginRenderPass)                                                                    \
     X(vkCmdBeginRendering)                                                                     \
     X(vkCmdBeginRenderingKHR)                                                                  \
@@ -353,6 +377,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateImage(VkDevice d, const VkImageCreateI
     return r;
 }
 
+void free_hd(HdImage& hd);
+
 // Drivers reuse handle values once an object is destroyed (the validation layer
 // hides this by wrapping handles). A stale replacement entry made the next image
 // with the same handle receive a full-size atlas copy past its end: GPU fault.
@@ -361,6 +387,11 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyImage(VkDevice d, VkImage image, const Vk
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         g_images.erase((uint64_t)image);
         if (g_replace.erase((uint64_t)image)) g_freed_replaced.insert((uint64_t)image);
+        auto hd = g_hd.find((uint64_t)image);
+        if (hd != g_hd.end()) {  // used by the same submissions as the game's image, so done with too
+            free_hd(hd->second);
+            g_hd.erase(hd);
+        }
     }
     real_vkDestroyImage(d, image, a);
 }
@@ -447,7 +478,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateShaderModule(VkDevice d, const VkShade
     VkResult r = real_vkCreateShaderModule(d, ci, a, out);
     if (r == VK_SUCCESS) {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
-        uint64_t h = 1469598103934665603ull;  // FNV-1a
+        uint64_t h = 1469598103934665603ull;  // FNV-1a with a non-standard basis: see content_name
         auto p = reinterpret_cast<const unsigned char*>(ci->pCode);
         for (size_t i = 0; i < ci->codeSize; ++i) h = (h ^ p[i]) * 1099511628211ull;
         char name[64];
@@ -663,8 +694,96 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipe
         auto& v = g_cmd[cb].sets;
         if (v.size() < first + n) v.resize(first + n);
         for (uint32_t i = 0; i < n; ++i) v[first + i] = (uint64_t)sets[i];
+        if (first == 0 && n && bp == VK_PIPELINE_BIND_POINT_GRAPHICS) g_cmd[cb].layout0 = (uint64_t)layout;
     }
     real_vkCmdBindDescriptorSets(cb, bp, layout, first, n, sets, ndyn, dyn);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo* ci,
+                                                              const VkAllocationCallbacks* a,
+                                                              VkDescriptorSetLayout* out) {
+    VkResult r = real_vkCreateDescriptorSetLayout(d, ci, a, out);
+    if (r == VK_SUCCESS) {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        const VkDescriptorSetLayoutBinding* b = ci->pBindings;
+        g_dsl_single[(uint64_t)*out] = ci->bindingCount == 1 && b[0].binding == 0 && b[0].descriptorCount == 1 &&
+                                       b[0].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    }
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL hk_vkAllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo* ai,
+                                                           VkDescriptorSet* out) {
+    VkResult r = real_vkAllocateDescriptorSets(d, ai, out);
+    if (r == VK_SUCCESS) {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        for (uint32_t i = 0; i < ai->descriptorSetCount; ++i)
+            g_set_layout[(uint64_t)out[i]] = (uint64_t)ai->pSetLayouts[i];
+    }
+    return r;
+}
+
+PFN_vkVoidFunction device_fn(const char* name);
+
+// For a draw that samples a texture with an HD twin: a descriptor set like the
+// bound set 0 but pointing at the twin, plus what to rebind afterwards.
+struct HdBind {
+    VkDescriptorSet ours = VK_NULL_HANDLE, original = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+};
+
+HdBind hd_bind_for(VkCommandBuffer cb) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    HdBind hb;
+    if (g_hd.empty() || !g_hd_on) return hb;
+    CmdState& st = g_cmd[cb];
+    if (st.sets.empty() || !st.layout0) return hb;
+    auto set = g_sets.find(st.sets[0]);
+    auto dsl = g_set_layout.find(st.sets[0]);
+    if (set == g_sets.end() || dsl == g_set_layout.end() || !g_dsl_single[dsl->second]) return hb;
+    const Binding* b0 = nullptr;
+    for (auto& b : set->second)
+        if (b.binding == 0) b0 = &b;
+    if (!b0) return hb;
+    auto v = g_view_image.find(b0->view);
+    auto hd = v == g_view_image.end() ? g_hd.end() : g_hd.find(v->second);
+    if (hd == g_hd.end()) return hb;
+    auto key = std::make_tuple((uint64_t)hd->second.view, b0->sampler, dsl->second);
+    auto cached = g_hd_sets.find(key);
+    VkDescriptorSet ours = cached != g_hd_sets.end() ? cached->second : VK_NULL_HANDLE;
+    if (!ours) {
+        if (!g_hd_pool) {
+            auto create_pool = reinterpret_cast<PFN_vkCreateDescriptorPool>(device_fn("vkCreateDescriptorPool"));
+            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096};
+            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+            pi.maxSets = 4096;
+            pi.poolSizeCount = 1;
+            pi.pPoolSizes = &ps;
+            if (!create_pool || create_pool(g_device, &pi, nullptr, &g_hd_pool) != VK_SUCCESS) {
+                g_hd_pool = VK_NULL_HANDLE;
+                return hb;
+            }
+        }
+        VkDescriptorSetLayout layout = (VkDescriptorSetLayout)dsl->second;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = g_hd_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &layout;
+        if (real_vkAllocateDescriptorSets(g_device, &ai, &ours) != VK_SUCCESS) return hb;
+        VkDescriptorImageInfo ii{(VkSampler)b0->sampler, hd->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = ours;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &ii;
+        real_vkUpdateDescriptorSets(g_device, 1, &w, 0, nullptr);  // the real one: not tracked as a game set
+        g_hd_sets[key] = ours;
+    }
+    hb.ours = ours;
+    hb.original = (VkDescriptorSet)st.sets[0];
+    hb.layout = (VkPipelineLayout)st.layout0;
+    return hb;
 }
 
 void trace_draw(VkCommandBuffer cb, const char* kind, uint32_t count) {
@@ -715,23 +834,29 @@ VkPipeline xbr_twin_for(VkCommandBuffer cb, VkPipeline* original) {
     return twin->second;
 }
 
-VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+// Swap in the xBR twin pipeline and/or an HD texture set around one draw.
+template <typename F>
+void substituted_draw(VkCommandBuffer cb, const char* kind, uint32_t count, F draw) {
     VkPipeline original = VK_NULL_HANDLE;
     VkPipeline twin = xbr_twin_for(cb, &original);
-    trace_draw(cb, twin ? "draw[xbr]" : "draw", vc);
+    HdBind hb = hd_bind_for(cb);
+    trace_draw(cb, hb.ours ? (twin ? "draw[xbr,hd]" : "draw[hd]") : (twin ? "draw[xbr]" : kind), count);
     if (twin) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, twin);
-    real_vkCmdDraw(cb, vc, ic, fv, fi);
+    // Set 0 holds only the texture (checked), so no dynamic offsets to repeat.
+    if (hb.ours) real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hb.layout, 0, 1, &hb.ours, 0, nullptr);
+    draw();
+    if (hb.ours)
+        real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hb.layout, 0, 1, &hb.original, 0, nullptr);
     if (twin) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+    substituted_draw(cb, "draw", vc, [&] { real_vkCmdDraw(cb, vc, ic, fv, fi); });
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_t ic, uint32_t fi,
                                                 int32_t vo, uint32_t fin) {
-    VkPipeline original = VK_NULL_HANDLE;
-    VkPipeline twin = xbr_twin_for(cb, &original);
-    trace_draw(cb, twin ? "drawIndexed[xbr]" : "drawIndexed", n);
-    if (twin) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, twin);
-    real_vkCmdDrawIndexed(cb, n, ic, fi, vo, fin);
-    if (twin) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+    substituted_draw(cb, "drawIndexed", n, [&] { real_vkCmdDrawIndexed(cb, n, ic, fi, vo, fin); });
 }
 
 // Transfers touching an enlarged image are not rescaled yet; make them visible.
@@ -857,7 +982,7 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBlitImage(VkCommandBuffer cb, VkImage src, Vk
 
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
     VkResult r = real_vkBindBufferMemory(d, b, m, off);
-    if (r == VK_SUCCESS && g_dump) {
+    if (r == VK_SUCCESS) {  // needed to read upload pixels (content replacement, dumps)
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         g_buf_mem[(uint64_t)b] = BufMem{(uint64_t)m, off};
     }
@@ -867,7 +992,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkBindBufferMemory(VkDevice d, VkBuffer b, VkD
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkMapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize off, VkDeviceSize size,
                                               VkMemoryMapFlags fl, void** pp) {
     VkResult r = real_vkMapMemory(d, m, off, size, fl, pp);
-    if (r == VK_SUCCESS && g_dump) {
+    if (r == VK_SUCCESS) {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         g_mem_map[(uint64_t)m] = MemMap{static_cast<char*>(*pp), off, size};
     }
@@ -882,37 +1007,58 @@ VKAPI_ATTR void VKAPI_CALL hk_vkUnmapMemory(VkDevice d, VkDeviceMemory m) {
     real_vkUnmapMemory(d, m);
 }
 
-// Write the pixels of a whole-image upload into a sampled texture to
-// <VKPROXY_DIR>\dump\<w>x<h>_<hash>.bgra (once per distinct content).
-void dump_upload(VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
+// The pixels of a whole-image upload into a sampled B8G8R8A8 texture, read from
+// the game's mapped staging memory, or null (partial upload, unmapped source...).
+const unsigned char* upload_pixels(VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r,
+                                   const ImageInfo** info) {
     auto im = g_images.find((uint64_t)dst);
-    if (im == g_images.end() || n != 1 || im->second.w < 256 || im->second.format != VK_FORMAT_B8G8R8A8_UNORM ||
-        (im->second.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
-        return;
+    if (im == g_images.end() || n != 1 || im->second.w * im->second.h < 64 ||
+        im->second.format != VK_FORMAT_B8G8R8A8_UNORM || (im->second.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        return nullptr;
     const ImageInfo& ii = im->second;
-    if (r[0].imageExtent.width != ii.w || r[0].imageExtent.height != ii.h ||
-        (r[0].bufferRowLength && r[0].bufferRowLength != ii.w))
-        return;
+    if (r[0].imageExtent.width != ii.w || r[0].imageExtent.height != ii.h || r[0].imageOffset.x ||
+        r[0].imageOffset.y || (r[0].bufferRowLength && r[0].bufferRowLength != ii.w))
+        return nullptr;
     auto bm = g_buf_mem.find((uint64_t)src);
-    if (bm == g_buf_mem.end()) return;
+    if (bm == g_buf_mem.end()) return nullptr;
     auto mm = g_mem_map.find(bm->second.memory);
-    if (mm == g_mem_map.end()) return;
+    if (mm == g_mem_map.end()) return nullptr;
     VkDeviceSize start = bm->second.offset + r[0].bufferOffset;
     VkDeviceSize size = 4ull * ii.w * ii.h;
     if (start < mm->second.offset || (mm->second.size != VK_WHOLE_SIZE && start + size > mm->second.offset + mm->second.size))
-        return;
-    const unsigned char* p = reinterpret_cast<unsigned char*>(mm->second.ptr + (start - mm->second.offset));
+        return nullptr;
+    *info = &ii;
+    return reinterpret_cast<unsigned char*>(mm->second.ptr + (start - mm->second.offset));
+}
+
+// "<w>x<h>_<hash of the pixels>": names dumps and content replacements. The
+// hash is FNV-1a 64 with 1469598103934665603 as offset basis (the standard
+// basis lost its last digit); every dump, replacement file and the shader name
+// kQuadFragShader depend on it, so it stays (tools/spr2.py matches it).
+std::string content_name(const ImageInfo& ii, const unsigned char* p) {
     uint64_t h = 1469598103934665603ull;
-    for (VkDeviceSize i = 0; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
-    char name[96];
-    snprintf(name, sizeof name, "%ux%u_%016llx.bgra", ii.w, ii.h, static_cast<unsigned long long>(h));
+    for (size_t i = 0, size = 4ull * ii.w * ii.h; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    char name[64];
+    snprintf(name, sizeof name, "%ux%u_%016llx", ii.w, ii.h, static_cast<unsigned long long>(h));
+    return name;
+}
+
+// Write the pixels of a whole-image upload into a sampled texture to
+// <VKPROXY_DIR>\dump\<w>x<h>_<hash>.bgra (once per distinct content).
+void dump_upload(VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
+    const ImageInfo* info = nullptr;
+    const unsigned char* p = upload_pixels(src, dst, n, r, &info);
+    if (!p) return;
+    const ImageInfo& ii = *info;
+    VkDeviceSize size = 4ull * ii.w * ii.h;
+    std::string name = content_name(ii, p) + ".bgra";
     if (!g_dumped.insert(name).second) return;
     std::string dir = g_dir + "\\dump";
     CreateDirectoryA(dir.c_str(), nullptr);
     if (FILE* f = fopen((dir + "\\" + name).c_str(), "wb")) {
         fwrite(p, 1, static_cast<size_t>(size), f);
         fclose(f);
-        logf("dump: %s", name);
+        logf("dump: %s", name.c_str());
     }
 }
 
@@ -938,28 +1084,22 @@ void free_staging(Staging& s) {
     s = Staging{};
 }
 
-// Host-visible buffer holding a replacement file, for uploads into its images.
-// Made once per file; a failed attempt is remembered as an empty Staging.
-VkBuffer staging_for(const Replacement& rp) {
-    auto cached = g_staging.find(rp.path);
-    if (cached != g_staging.end()) return cached->second.buffer;
-    Staging& st = g_staging[rp.path];
+// Host-visible buffer holding a replacement file (rp.w x rp.h BGRA), or empty.
+Staging load_staging(const Replacement& rp) {
+    Staging st;
     auto create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(device_fn("vkCreateBuffer"));
     auto requirements =
         reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(device_fn("vkGetBufferMemoryRequirements"));
     auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(device_fn("vkAllocateMemory"));
     auto bind = reinterpret_cast<PFN_vkBindBufferMemory>(device_fn("vkBindBufferMemory"));
     auto map = reinterpret_cast<PFN_vkMapMemory>(device_fn("vkMapMemory"));
-    if (!create_buffer || !requirements || !allocate || !bind || !map) return VK_NULL_HANDLE;
+    if (!create_buffer || !requirements || !allocate || !bind || !map) return st;
 
     VkDeviceSize size = 4ull * rp.w * rp.h;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (create_buffer(g_device, &bi, nullptr, &st.buffer) != VK_SUCCESS) {
-        st.buffer = VK_NULL_HANDLE;
-        return VK_NULL_HANDLE;
-    }
+    if (create_buffer(g_device, &bi, nullptr, &st.buffer) != VK_SUCCESS) return Staging{};
     VkMemoryRequirements req;
     requirements(g_device, st.buffer, &req);
     uint32_t type = memory_type(req.memoryTypeBits,
@@ -977,9 +1117,172 @@ VkBuffer staging_for(const Replacement& rp) {
             fclose(f);
         }
     }
-    logf("replace: staged %s (%u bytes read)", rp.path.c_str(), static_cast<unsigned>(got));
-    if (got != size) free_staging(st);
+    if (got != size) {
+        logf("replace: could not read %s (%u bytes)", rp.path.c_str(), static_cast<unsigned>(got));
+        free_staging(st);
+    }
+    return st;
+}
+
+// Staging for a font atlas, kept for the session: the game recreates its atlases
+// often. A failed attempt is remembered as an empty Staging.
+VkBuffer staging_for(const Replacement& rp) {
+    auto cached = g_staging.find(rp.path);
+    if (cached != g_staging.end()) return cached->second.buffer;
+    Staging st = load_staging(rp);
+    if (st.buffer) logf("replace: staged %s", rp.path.c_str());
+    g_staging[rp.path] = st;
     return st.buffer;
+}
+
+// One-off staging (HD twins: thousands of files) is freed this many presents
+// after the copy was recorded, by when the GPU has long finished it.
+const unsigned kStagingFrames = 16;
+std::vector<std::pair<Staging, unsigned>> g_staging_retire;  // staging, frame recorded
+
+void free_retired_staging(bool all) {
+    size_t keep = 0;
+    for (auto& s : g_staging_retire) {
+        if (all || g_frame - s.second > kStagingFrames)
+            free_staging(s.first);
+        else
+            g_staging_retire[keep++] = s;
+    }
+    g_staging_retire.resize(keep);
+}
+
+// Index the content replacements once: <replace>\<w>x<h>_<hash>@<scale>.bgra.
+void scan_hd_files() {
+    g_hd_scanned = true;
+    WIN32_FIND_DATAA fd;
+    std::string pattern = g_replace_dir + "\\*x*_*@" + std::to_string(g_layer_scale) + ".bgra";
+    HANDLE find = FindFirstFileA(pattern.c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        std::string n = fd.cFileName;
+        unsigned w = 0, h = 0;
+        char hash[17] = {};
+        size_t at = n.rfind('@');
+        if (at != std::string::npos && sscanf(n.c_str(), "%ux%u_%16[0-9a-f]", &w, &h, hash) == 3 && strlen(hash) == 16 &&
+            n.substr(0, at) == std::to_string(w) + "x" + std::to_string(h) + "_" + hash) {
+            g_hd_names.insert(n.substr(0, at));
+            g_hd_sizes.insert({w, h});
+        }
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    logf("hd: %u content replacements in %s", static_cast<unsigned>(g_hd_names.size()), g_replace_dir.c_str());
+}
+
+void free_hd(HdImage& hd) {
+    auto free_sets = reinterpret_cast<PFN_vkFreeDescriptorSets>(device_fn("vkFreeDescriptorSets"));
+    auto destroy_view = reinterpret_cast<PFN_vkDestroyImageView>(device_fn("vkDestroyImageView"));
+    auto destroy_image = reinterpret_cast<PFN_vkDestroyImage>(device_fn("vkDestroyImage"));
+    auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(device_fn("vkFreeMemory"));
+    for (auto it = g_hd_sets.begin(); it != g_hd_sets.end();) {
+        if (std::get<0>(it->first) == (uint64_t)hd.view) {
+            if (free_sets && g_hd_pool) free_sets(g_device, g_hd_pool, 1, &it->second);
+            it = g_hd_sets.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (hd.view && destroy_view) destroy_view(g_device, hd.view, nullptr);
+    if (hd.image && destroy_image) destroy_image(g_device, hd.image, nullptr);
+    if (hd.memory && free_memory) free_memory(g_device, hd.memory, nullptr);
+    hd = HdImage{};
+}
+
+// A sampled image `scale` times the size of ii, with a view, or an empty HdImage.
+HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
+    HdImage hd;
+    hd.name = name;
+    auto requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(device_fn("vkGetImageMemoryRequirements"));
+    auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(device_fn("vkAllocateMemory"));
+    auto bind = reinterpret_cast<PFN_vkBindImageMemory>(device_fn("vkBindImageMemory"));
+    if (!requirements || !allocate || !bind) return hd;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = ii.format;
+    ci.extent = {ii.w * scale, ii.h * scale, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (real_vkCreateImage(g_device, &ci, nullptr, &hd.image) != VK_SUCCESS) {
+        hd.image = VK_NULL_HANDLE;
+        return hd;
+    }
+    VkMemoryRequirements req;
+    requirements(g_device, hd.image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = memory_type(req.memoryTypeBits, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = hd.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = ii.format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (ai.memoryTypeIndex == UINT32_MAX || allocate(g_device, &ai, nullptr, &hd.memory) != VK_SUCCESS ||
+        bind(g_device, hd.image, hd.memory, 0) != VK_SUCCESS ||
+        real_vkCreateImageView(g_device, &vi, nullptr, &hd.view) != VK_SUCCESS)
+        free_hd(hd);
+    return hd;
+}
+
+// For each upload into a sampled texture: when its pixels have a replacement
+// file, record (into cb, after the game's own copy) the fill of an HD twin.
+void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
+    if (g_layer_scale < 2 || !g_replace_on || !g_swap_w) return;
+    if (!g_hd_scanned) scan_hd_files();
+    auto existing = g_hd.find((uint64_t)dst);
+    if (g_hd_names.empty() && existing == g_hd.end()) return;
+    auto im = g_images.find((uint64_t)dst);
+    if (im == g_images.end()) return;
+    std::string name;
+    const ImageInfo* info = nullptr;
+    if (g_hd_sizes.count({im->second.w, im->second.h}))
+        if (const unsigned char* p = upload_pixels(src, dst, n, r, &info)) name = content_name(*info, p);
+    if (existing != g_hd.end()) {
+        if (existing->second.name == name) return;  // same pixels again: the twin is still right
+        g_hd_retired.push_back(existing->second);   // new pixels; old twin may still be in flight
+        g_hd.erase(existing);
+    }
+    if (name.empty() || !g_hd_names.count(name)) return;
+    const ImageInfo& ii = *info;
+    Replacement rp{g_replace_dir + "\\" + name + "@" + std::to_string(g_layer_scale) + ".bgra",
+                   ii.w * g_layer_scale, ii.h * g_layer_scale};
+    auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(device_fn("vkCmdPipelineBarrier"));
+    if (!barrier) return;
+    Staging st = load_staging(rp);
+    if (!st.buffer) return;
+    g_staging_retire.push_back({st, g_frame});
+    VkBuffer staged = st.buffer;
+    HdImage hd = make_hd(ii, g_layer_scale, name);
+    if (!hd.image) return;
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = hd.image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy reg{};
+    reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    reg.imageExtent = {rp.w, rp.h, 1};
+    real_vkCmdCopyBufferToImage(cb, staged, hd.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    g_hd[(uint64_t)dst] = hd;
+    static unsigned logged = 0;
+    if (logged++ < 100) logf("hd: img#%u %s -> %ux%u twin", ii.id, name.c_str(), rp.w, rp.h);
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
@@ -1009,6 +1312,8 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffe
         return;
     }
     real_vkCmdCopyBufferToImage(cb, src, dst, dl, n, r);
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    hd_upload(cb, src, dst, n, r);
 }
 
 void free_readback(Readback& rb) {
@@ -1135,8 +1440,17 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         for (auto& s : g_staging) free_staging(s.second);
         g_staging.clear();
+        free_retired_staging(true);
         for (auto& rb : g_readback) free_readback(rb.second);
         g_readback.clear();
+        for (auto& hd : g_hd) free_hd(hd.second);
+        g_hd.clear();
+        for (auto& hd : g_hd_retired) free_hd(hd);
+        g_hd_retired.clear();
+        auto destroy_pool = reinterpret_cast<PFN_vkDestroyDescriptorPool>(device_fn("vkDestroyDescriptorPool"));
+        if (g_hd_pool && destroy_pool) destroy_pool(d, g_hd_pool, nullptr);
+        g_hd_pool = VK_NULL_HANDLE;
+        g_hd_sets.clear();
         auto destroy_pipeline = reinterpret_cast<PFN_vkDestroyPipeline>(device_fn("vkDestroyPipeline"));
         auto destroy_module = reinterpret_cast<PFN_vkDestroyShaderModule>(device_fn("vkDestroyShaderModule"));
         for (auto& t : g_xbr_twin)
@@ -1203,6 +1517,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
         if (logged++ < 20) logf("ERROR vkQueuePresentKHR -> %d at frame %u", static_cast<int>(r), g_frame);
     }
     ++g_frame;
+    if (!g_staging_retire.empty()) free_retired_staging(false);
     if (g_trace) {
         logf("== end of traced frame %u (%u xbr draws)", g_frame, g_xbr_draws);
         g_trace = false;
@@ -1215,13 +1530,19 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
     bool focused = pid == GetCurrentProcessId();
     bool toggle = (GetAsyncKeyState(VK_F10) & 1) && focused;
     bool trace = (GetAsyncKeyState(VK_F11) & 1) && focused;
+    bool hd_toggle = (GetAsyncKeyState(VK_F9) & 1) && focused;
     if (g_frame % 30 == 0) {
         toggle = consume_trigger("xbr.toggle") || toggle;
         trace = consume_trigger("trace.now") || trace;
+        hd_toggle = consume_trigger("hd.toggle") || hd_toggle;
     }
     if (toggle) {
         g_xbr_on = !g_xbr_on;
         logf("== xbr %s at frame %u", g_xbr_on ? "on" : "off", g_frame);
+    }
+    if (hd_toggle) {
+        g_hd_on = !g_hd_on;
+        logf("== hd %s at frame %u", g_hd_on ? "on" : "off", g_frame);
     }
     if (trace) {
         g_trace = true;

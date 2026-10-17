@@ -16,7 +16,12 @@ instead of the system loader. It forwards every call to the real loader
   next to the DLL when that file exists (HD font atlases, generated from the user's own
   game files; never shipped);
 - for each pipeline that uses the game's textured-quad fragment shader, creates a twin
-  pipeline with `src/xbr.frag` and uses it for magnified draws.
+  pipeline with `src/xbr.frag` and uses it for magnified draws;
+- content replacement: when the pixels uploaded into a sampled texture hash to a file
+  `vkproxy\replace\<w>x<h>_<hash>@<scale>.bgra` (made by `tools/hd_art.py` from the
+  user's own game files: HD object sprites), keeps an HD twin image and binds it for the
+  draws that sample that texture. The game's own image is untouched; textures without a
+  file keep xBR.
 
 ## Build
 
@@ -33,9 +38,10 @@ powershell -File vkproxy\build.ps1   # -> vkproxy\build\vulkan-1.dll
 2. Copy `vkproxy\build\vulkan-1.dll` next to `Sims.exe`, and the HD font atlases (if
    generated) to `vkproxy\replace\` in the same folder. Remove both to uninstall.
 
-Keys (only while the game window has focus): **F10** toggles xBR on/off, **F11** logs every
-render pass and draw of the next frame. Creating an empty file `xbr.toggle` or `trace.now` in
-the output folder does the same without touching the keyboard. Log and dumped shaders go to
+Keys (only while the game window has focus): **F9** toggles the HD (content-replaced)
+textures, **F10** toggles xBR, **F11** logs every render pass and draw of the next frame.
+Creating an empty file `hd.toggle`, `xbr.toggle` or `trace.now` in the output folder does
+the same without touching the keyboard. Log and dumped shaders go to
 `%VKPROXY_DIR%` (default `%TEMP%\vkproxy`).
 
 Environment variables, for testing (set before starting `Sims.exe` directly; needs

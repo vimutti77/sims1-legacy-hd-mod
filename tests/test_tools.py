@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import exe_strings  # noqa: E402
 import far  # noqa: E402
+import ffn  # noqa: E402
+import font_atlas  # noqa: E402
 import iff  # noqa: E402
 import inventory  # noqa: E402
 
@@ -38,6 +40,105 @@ def make_iff(chunks: list[tuple[str, int, str, bytes]], version: bytes = b"2.5")
         out += ctype.encode() + struct.pack(">IHH", 76 + len(data), cid, 0x10)
         out += label.encode().ljust(64, b"\0") + data
     return out
+
+
+def make_ffn(glyphs: dict[int, tuple[int, int, int, int, int]], sheet_rows: int = 16) -> bytes:
+    """FFN with glyphs {code: (w, h, x, y, top)}; every glyph pixel has value 15."""
+    records = b"".join(ffn.RECORD.pack(code, w, h, x, y, 1, 1, top) for code, (w, h, x, y, top) in glyphs.items())
+    data_off = ffn.RECORDS + len(records)
+    header = bytearray(ffn.RECORDS)
+    header[:4] = ffn.MAGIC
+    struct.pack_into("<H", header, 0x0A, len(glyphs))
+    struct.pack_into("<I", header, 0x1C, data_off)
+    sheet = bytearray(ffn.SHEET_W * sheet_rows)
+    for w, h, x, y, _ in glyphs.values():
+        for yy in range(h):
+            for xx in range(w):
+                if (y + yy) < sheet_rows:  # a glyph may deliberately overhang the sheet
+                    sheet[(y + yy) * ffn.SHEET_W + x + xx] = 15
+    packed = bytes((sheet[i] << 4) | sheet[i + 1] for i in range(0, len(sheet), 2))
+    palette = bytes(17 * i for i in range(16))
+    return bytes(header) + records + palette + packed
+
+
+def box_renderer(ch: str, size: int, width: int) -> font_atlas.Ink:
+    """Fake renderer: every character is a solid box size tall and width (or size // 2) wide,
+    with its top 2 px below the canvas top and the baseline at its bottom."""
+    w, h = size * 3 + 8, size * 2 + 8
+    bw = width or size // 2
+    x0 = size // 2
+    cov = bytearray(w * h)
+    for y in range(2, 2 + size):
+        cov[y * w + x0:y * w + x0 + bw] = b"\xff" * bw
+    return font_atlas.Ink(w, h, bytes(cov), size + 2)
+
+
+class FfnTests(unittest.TestCase):
+    def test_reads_glyphs_and_pixels(self):
+        font = ffn.read_ffn(make_ffn({ord("A"): (3, 4, 5, 2, 1), ord("B"): (2, 2, 0, 8, 0)}))
+        self.assertEqual(sorted(font.glyphs), [ord("A"), ord("B")])
+        a = font.glyphs[ord("A")]
+        self.assertEqual((a.w, a.h, a.x, a.y, a.left, a.right, a.top), (3, 4, 5, 2, 1, 1, 1))
+        self.assertEqual(font.pixels(ord("A")), [[15] * 3] * 4)
+        self.assertEqual(font.sheet[2 * ffn.SHEET_W + 4], 0)  # just left of A
+        self.assertEqual(font.palette[15], 255)
+
+    def test_rejects_bad_files(self):
+        good = make_ffn({ord("A"): (3, 4, 0, 0, 0)}, sheet_rows=4)
+        with self.assertRaises(ffn.FfnError):
+            ffn.read_ffn(b"XXXX" + good[4:])
+        with self.assertRaises(ffn.FfnError):
+            ffn.read_ffn(good[:40])  # bitmap offset past the end
+        with self.assertRaises(ffn.FfnError):  # glyph below the sheet
+            ffn.read_ffn(make_ffn({ord("A"): (3, 4, 0, 2, 0)}, sheet_rows=4))
+
+
+class FontAtlasTests(unittest.TestCase):
+    def test_layout_matches_game_packer(self):
+        g = lambda w, h: ffn.Glyph(w, h, 0, 0, 1, 1, 0)  # noqa: E731
+        glyphs = {1: g(600, 10), 2: g(300, 20), 3: g(200, 5), 4: g(0, 9), 5: g(900, 5)}
+        cells, w, h = font_atlas.layout(glyphs)
+        # 3 wraps (900 + 200 > 1024) by the tallest glyph so far (20); 5 wraps again
+        # by 20, not by the 5 of its own row: the step is never reset. 4 is empty.
+        self.assertEqual(cells, {1: (0, 0), 2: (600, 0), 3: (0, 20), 5: (0, 40)})
+        self.assertEqual((w, h), (900, 45))
+
+    def test_build_atlas_draws_inside_cells(self):
+        # Seven 4x6 glyphs and one narrow 2x6 'm': 7/8 fit at full size (>= 85%),
+        # so the size stays at the 'H' match and 'm' alone is condensed.
+        glyphs = {ord(c): (4, 6, 4 * i, 0, 0) for i, c in enumerate("Habcdef")}
+        glyphs[ord("m")] = (2, 6, 28, 0, 0)
+        font = ffn.read_ffn(make_ffn(glyphs))
+        aw, ah, cov, st = font_atlas.build_atlas(font, 3, box_renderer)
+        self.assertEqual((aw, ah), (30, 6))
+        W = aw * 3
+        self.assertEqual(len(cov), W * 18)
+        self.assertEqual((st.size, st.baseline, st.fit, st.drawn), (18, 18, 7, 8))
+        cells, _, _ = font_atlas.layout(font.glyphs)
+
+        def ink_in(code):
+            (cx, cy), g = cells[code], font.glyphs[code]
+            return [(x, y) for y in range(cy * 3, (cy + g.h) * 3) for x in range(cx * 3, (cx + g.w) * 3)
+                    if cov[y * W + x]]
+
+        h = ink_in(ord("H"))
+        self.assertEqual(len(h), 9 * 18)  # 9-wide box, centred in the 12-wide cell, full height
+        self.assertEqual(min(x for x, _ in h), 1)
+        m = ink_in(ord("m"))  # 9 wide at this size, 6-wide cell: condensed to fit
+        self.assertTrue(m and max(x for x, _ in m) - min(x for x, _ in m) + 1 <= 6)
+        self.assertEqual(st.condensed, 1)
+        self.assertEqual(st.nudged, 0)
+        self.assertEqual(sum(1 for v in cov if v), sum(len(ink_in(ord(c))) for c in "Habcdefm"))
+
+    def test_to_bgra_is_premultiplied_white(self):
+        self.assertEqual(font_atlas.to_bgra(bytes([0, 128])), bytes([0, 0, 0, 0, 128, 128, 128, 128]))
+
+    @unittest.skipUnless(sys.platform == "win32", "GDI rendering needs Windows")
+    def test_gdi_renderer_supersamples(self):
+        ink = font_atlas.gdi_renderer()("H", 24, 0)
+        self.assertIsNotNone(ink.bbox())
+        self.assertGreater(ink.ascent, 0)
+        self.assertGreater(len(set(ink.cov)), 17)  # more grey levels than GDI's 4x4 anti-aliasing
 
 
 class FarTests(unittest.TestCase):

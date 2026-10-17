@@ -9,8 +9,9 @@ Make **The Sims™ Legacy Collection** (The Sims 1, 2025 re-release, Steam) look
 ## Current state
 
 - **Phase 0 done (2026-10-17). Results: `docs/FINDINGS.md`.** H2, H3, H4 true; H1 probably false (no layout data found).
-- `tools/` have been run against the real install. `far.py` lists `UIGraphics.far` fine. `iff.py` had the wrong header signature; fixed (all 1,578 install `.iff` files parse). 9 tests pass (`py -m unittest discover -s tests`; on this machine `python` is the Store alias, use `py`).
-- `launcher/` (SimsLauncher.ps1 + Sims4K.bat) switches the display to 1920×1080 via Win32 `ChangeDisplaySettings`, launches Sims.exe, restores. Still **not tested on Windows**, and probably superseded: in-game Resolution `3840x2160 (16:9)` + launch option `-dpi:2` gives crisp 2× nearest-neighbor scaling without touching the desktop.
+- **Phase 1 works and is in daily use (2026-10-17)**: `vkproxy/` draws UI windows at screen resolution, swaps in HD font atlases and xBRs the remaining bitmaps; plain Steam launch, saving works. Details and the bugs found on the way: FINDINGS "Phase 1".
+- `tools/`: `far.py`, `iff.py`, `inventory.py`, `exe_strings.py`, `ffn.py` (font reader), `font_atlas.py` (builds the HD atlases from the user's install). 15 tests pass (`py -m unittest discover -s tests`; on this machine `python` is the Store alias, use `py`).
+- `launcher/` (display-mode switcher) is superseded by in-game Resolution + vkproxy; never tested on Windows.
 
 ## Key facts gathered so far
 
@@ -20,24 +21,36 @@ Make **The Sims™ Legacy Collection** (The Sims 1, 2025 re-release, Steam) look
 - `Sims.exe` is 32-bit, wrapped in **SteamStub** (`.bind` section): `.text` is encrypted on disk, so analyse a memory dump of the running process (ASLR on). Renderer is Vulkan.
 - Real user data (saves, `Options.iff`) is in `%USERPROFILE%\Saved Games\Electronic Arts\The Sims 25\UserData\`, not the install folder; the game rewrites `Options.iff` and character files on exit.
 - UI bitmaps: `UIGraphics\UIGraphics.far` (8-bit RLE8 BMPs). **Loose files at `UIGraphics\<dir>\<name>` override the FAR** (H3). `Res_*.RT` only map resource IDs to bitmap paths; no coordinates, so layout is likely hard-coded in the exe.
-- Rendering at `-dpi:2`: UI is drawn at logical resolution and nearest-upscaled; the in-lot world is drawn at native resolution with smooth filtering.
+- Rendering: UI is drawn at logical resolution and nearest-upscaled; the in-lot world is drawn at native resolution (sprites magnified with nearest).
 - FaithBeam's Sims 1 Widescreen Patcher does **not** accept the Legacy exe.
 - sims2-4k-ui-patch (lah7) is the reference project for Sims 2; Sims 2 Legacy exposes `uiScaleFactor` (cheat `uintProp uiScaleFactor 1|2|3`, and `Graphics Rules.sgr`).
 - Sims themselves are real-time 3D meshes with bitmap textures; objects/walls/floors are pre-rendered SPR2 sprites (color + alpha + z-buffer, 3 zoom levels). (From original-game knowledge; not yet checked.)
 
-## Current approach (Phase 1)
+## How Phase 1 works
 
-The game draws each UI window (and each neighbourhood lot image) into its own 1× render target, then composites it onto the frame scaled ×s with a nearest sampler. Text comes from font atlases (1020×64, 1018×52, 1018×43) drawn as glyph quads; icons are 4-state sprite sheets.
+The game draws each UI window (and each neighbourhood lot image, tooltip, …) into its own 1× render target, then composites it onto the frame scaled ×s (UI scale) with a nearest sampler. Text is glyph quads from font atlases the game packs from `.ffn` files at load time; icons are 4-state sprite sheets.
 
-- `vkproxy/` is a drop-in 32-bit `vulkan-1.dll` (next to `Sims.exe`) that forwards to the real loader. Done: xBR on the UI-layer composite draws (works, user keeps it). User's chosen UI scale: 3× (Resolution `3840x2160`, no `-dpi`).
-- Next: (1) enlarge UI-layer render targets 3× inside the proxy (images, framebuffers, render area, viewport/scissor, clears, copies) so layout/input stay the same; (2) re-render the font atlases at 3× from a vector font; (3) per-texture xBR (later AI/hand-made) for icons.
-- Testing setup: `steam_appid.txt` (3314060) next to `Sims.exe` stops Steam relaunching the game, so it can be started directly (needed for RenderDoc and env vars). Don't send keystrokes while the user's editor has focus; use the proxy's trigger files (`xbr.toggle`, `trace.now` in `%VKPROXY_DIR%`).
+`vkproxy/` is a drop-in 32-bit `vulkan-1.dll` (next to `Sims.exe`) that forwards to the real loader and, by default:
+- creates every render target smaller than the swapchain ×s (s = swapchain height / 600, lowered by `-dpi:N`) and scales all drawing into it; `vkCmdCopyImageToBuffer` from such a target (lot thumbnails on save) reads a nearest-shrunk 1× copy;
+- replaces a sampled texture of w×h with `<game>\vkproxy\replace\<w>x<h>@<s>.bgra` (HD font atlases from `tools/font_atlas.py`; atlas sizes are unique per font);
+- draws every UI textured quad with an xBR twin pipeline (the shader passes through at ~1:1).
+
+User's setup: Resolution `3840x2160 (16:9)`, no `-dpi` (s = 3), launched from Steam. Env vars (`VKPROXY_*`, see `vkproxy/README.md`) are for testing only.
+
+Testing notes:
+- `steam_appid.txt` (3314060) next to `Sims.exe` lets the game be started directly (for env vars, RenderDoc); remove it at the end of the project.
+- Don't send keystrokes or clicks while the user's editor has focus; use the proxy's trigger files (`xbr.toggle`, `trace.now` in the log folder) or ask the user to press F10/F11.
+- Check whether the user is playing before killing `Sims.exe`. Before asking the user to save during a test, back up `UserData`; restore with `robocopy /MIR` and verify.
+- 32-bit Vulkan validation layer: Vulkan SDK 1.3.296 `Bin32` (1.4 has none). It wraps handles, so it hides handle-reuse bugs (see FINDINGS).
+- Proxy state keyed by Vulkan handles must be dropped on destroy: drivers reuse handle values.
 
 ## Next steps
 
-1. UI-layer enlargement in `vkproxy` (see above).
-2. Untested: setting launch options in Steam Launch Options (only tested by running `Sims.exe` directly), `-maxaspect`, `-monitor`, `-skip_intro`, `-w`.
-3. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
+1. Shadow fonts `_11_s`, `_11_bs`, `_12_bs`, `_14_bs` (and `_48`): find where the game uses them (none seen in traces yet), then extend `font_atlas.py` (bold + shadow).
+2. HD icons: dump uploads (`VKPROXY_DUMP=1`), upscale (AI or redraw), replace by content hash instead of size.
+3. Phase 4 (in-lot world): xBR twins for the world shaders or sprite replacement; shader notes in FINDINGS.
+4. Untested: Steam Launch Options, `-maxaspect`, `-monitor`, `-skip_intro`, `-w`; other resolutions (1440p → s = 2, needs `--scale 2` atlases).
+5. If the memory-dump / xref analysis is needed again (e.g. after an EA update), move those scripts into `tools/` with tests; method is in FINDINGS "วิธีทำซ้ำ". The game has not been updated since 2025-04-04.
 
 Install folder: `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection` (app 3314060). Backups of it and of Saved Games are in `backup\`.
 

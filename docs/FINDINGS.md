@@ -136,6 +136,60 @@
 - หน้าละแวกบ้าน: รูปแปลงบ้านแต่ละแปลงก็เป็นเลเยอร์แยก (160×86 เป็นต้น) จึงโดน xBR ด้วย ตอนแรกมีเส้นสีเขียวตามขอบแปลงและสีเข้มขึ้น สาเหตุมีสองข้อ: sampler ของ UI ใช้ address mode **REPEAT** (อ่านเลยขอบแล้ววนไปอีกฝั่ง) และรูปแปลงเก็บสีไว้ในพิกเซลที่ alpha = 0 แก้แล้วด้วยการอ่าน texel แบบหนีบพิกัด (`texelFetch` + clamp) และผสมค่าดิบโดยไม่ premultiply
 - ขนาด UI บนจอ 4K เลือกได้จาก Resolution + `-dpi`: 2× (3840x2160 + `-dpi:2`), 2.81× (1364x768: เกมวาดที่ 3× แล้วย่อ 0.9375 แบบ linear), 3× (3840x2160 ไม่ใส่ `-dpi`) shader xBR ปรับตาม scale เอง scale ที่ไม่อยู่ในรายการ (เช่น 2.5×) ต้องแพตช์รายการ Resolution ในหน่วยความจำเกม
 
+## Phase 1: วาด UI ที่ความละเอียดจอ + font HD (2026-10-17)
+
+สถานะ: ใช้เล่นจริงได้ เปิดผ่าน Steam ได้โดยไม่ต้องตั้งอะไร (Resolution `3840x2160 (16:9)` ไม่ใส่ `-dpi`) เซฟได้ปกติ
+
+### ขยายเลเยอร์ UI (1b)
+
+- DLL สร้าง render target ทุกตัวที่เล็กกว่า swapchain (เลเยอร์ UI, รูปแปลงบ้าน, tooltip ฯลฯ) ใหญ่ขึ้นเท่ากับสเกล UI ของเกม และขยายทุกอย่างที่วาดลงไป: framebuffer, `renderArea`, viewport/scissor (เก็บค่าที่เกมตั้งไว้ แล้วคูณใหม่ตอนเข้า pass), สี่เหลี่ยมของ `vkCmdClearAttachments` (หนีบให้อยู่ใน render area) เลเยอร์จึงถูกประกอบลงจอแบบ 1:1 แทนการขยาย nearest
+- สเกล = ความสูง swapchain ÷ 600 (ปัดลง) ถ้ามี `-dpi:N` ใช้ค่าที่น้อยกว่า ตรงกับสูตรของเกม (ดู "สูตรคำนวณสเกล") `VKPROXY_LAYER_SCALE=N` บังคับค่าได้ `1` = ปิด
+- framebuffer ที่ขยายแล้วจะใหญ่เกิน attachment ตัวที่ไม่ได้ขยายไม่ได้ (GPU พัง) จึงขยายเฉพาะเมื่อ attachment ทุกตัวรับขนาดใหม่ได้
+- xBR ทำกับ quad ทุกตัวของ pipeline UI (ไอคอนและ bitmap ที่ยังเป็น 1×) shader ใช้ xBR เฉพาะเมื่อ quad ถูกขยายตั้งแต่ 1.5 เท่า (วัดจาก `fwidth`) ถ้าวาด 1:1 (atlas HD, เลเยอร์ที่ขยายแล้ว) จะอ่าน texel ตรงๆ
+
+### Font
+
+- font ของ UI คือ `UIGraphics.far` → `Fonts\variablesans_{07,08,09,10,11,12,14,16,18,20}.ffn` และแบบเงา `_11_s`, `_11_bs`, `_12_bs`, `_14_bs` (+ `_48`, และโฟลเดอร์ภาษา Polish/Russian/…) ตารางชื่อ font ใน exe จับคู่ `kVariableSans` กับ "Comic Sans MS"
+- รูปแบบ `.ffn` (อนุมานเอง): `FNTF`, จำนวน glyph u16 ที่ 0x0A, offset ของ bitmap u32 ที่ 0x1C, record 11 ไบต์ต่อ glyph จาก 0x20 (`<HBBHHbbb`: ตัวอักษร, w, h, x, y, left, right, top) แล้ว palette เทา 16 ไบต์ + sheet 4-bit กว้าง 256 → `tools/ffn.py`
+- เกมแพ็ก glyph ลง atlas ตอนโหลด: เรียงตามรหัส ข้ามตัวที่ w หรือ h = 0 ขึ้นแถวใหม่เมื่อ x + w > 1024 ระยะขึ้นแถว = glyph ที่สูงที่สุดเท่าที่เคยเจอ (ไม่ reset และนับตัวที่ทำให้ขึ้นแถวด้วย) ความสูง atlas = ขอบล่างต่ำสุด ตรวจกับ atlas ที่ dump จากเกม 10 ตัวแล้ว ตรงทุกพิกเซล ขนาด atlas ไม่ซ้ำกันเลยใช้ขนาดระบุ font ได้: 1023×36 (07), 1018×43 (08), 1020×47 (09), 1018×52 (10), 1005×82 (11), 1020×64 (12), 1017×97 (14), 1022×106 (16), 1020×121 (18), 1022×208 (20), 1024×60 (11_s), 1023×78 (11_bs), 1018×85 (12_bs), 1015×99 (14_bs)
+- pixel ใน atlas เป็นขาว premultiplied
+- DLL แทน texture ที่ sample ได้ขนาด w×h ด้วย `vkproxy\replace\<w>x<h>@<scale>.bgra` ข้าง DLL (สร้าง image ใหญ่ขึ้น scale เท่า และเปลี่ยนการ upload ทุกครั้งเป็นการ copy ทั้งไฟล์) → `tools/font_atlas.py` สร้างไฟล์เหล่านี้จาก font ของเกม: วาด Comic Sans ใหม่ลงช่องเดิมของแต่ละ glyph ขนาดเดียวทั้ง font ใช้ baseline ร่วม ตัวที่กว้างเกินช่องใช้ `lfWidth` บีบ
+- **ต้อง supersample:** รอบแรกให้ GDI วาดตรงๆ (anti-alias ของ GDI มีแค่ ~15 ระดับ และดัดเส้นเข้าตารางพิกเซล) font เล็กสุด (07, ใช้กับป้ายราคา) เส้นหนาไม่เท่ากันจนดูแตก แก้เป็นวาด 4× แล้วเฉลี่ยย่อ (`StretchBlt` HALFTONE) ได้ 255 ระดับ
+- ตัวหนังสือในเกมวาดสองแบบ: tooltip/ป้ายราคาเป็นเลเยอร์เล็กของตัวเอง (เช่น 32×15) ส่วนเมนูวงกลม (pie menu) วาดตรงลงภาพประกอบด้วย font 12 สองรอบ (รอบแรกสีเข้มเยื้อง = เงา) ทั้งสองแบบได้ font HD แล้ว ยังไม่เจอจุดที่ใช้ `_s`/`_bs`/`48`
+
+### GPU ค้าง (device lost) — แก้แล้ว
+
+- อาการ: ภาพค้างแต่เสียงและเกมยังเดิน เมาส์ขยับได้ `vkQueueSubmit` คืน -4 และ Event Log มี `nvlddmkm` 153 เกิดเฉพาะตอนเปิด 1b + แทน font เกิดในไม่กี่นาที
+- validation layer (Vulkan SDK 1.4 ไม่มี 32-bit ต้องใช้ 1.3.296 + component `com.lunarg.vulkan.32bit`) ไม่เจอ error และ**พอใส่ validation แล้วไม่ค้างเลย** 16 นาที
+- สาเหตุ: เกมสร้างและลบ texture font atlas ตลอดเวลา (225 ครั้งใน 16 นาที) driver เอา handle ของ image ที่ถูกลบไปใช้กับ image ใหม่ แต่ DLL ไม่ได้ลบบันทึก "image นี้ต้องแทนด้วย atlas" ออก image ใหม่ (เช่นไอคอน 8×14) จึงโดน copy atlas 3× ทั้งก้อนเกินขอบ validation layer ห่อ handle ให้ไม่ซ้ำกัน บั๊กเลยไม่โผล่ตอนมี validation
+- แก้: hook `vkDestroyImage` ลบบันทึกทุกอย่างของ image นั้น, staging buffer ทำครั้งเดียวต่อไฟล์ (เดิมทำใหม่ทุกครั้งที่เกมสร้าง atlas = หน่วยความจำรั่ว), คืนทรัพยากรของ DLL ตอน `vkDestroyDevice` หลังแก้ log เห็น handle ถูกใช้ซ้ำจริง 20 ครั้งใน 1 นาทีแรก และไม่ค้างอีก
+- บทเรียน: state ใน proxy ที่ใช้ handle เป็น key ต้องลบตอน destroy เสมอ และอย่าเชื่อผลจาก validation layer เรื่องที่ขึ้นกับการใช้ handle ซ้ำ
+
+### การอ่านภาพกลับตอนเซฟ — แก้แล้ว
+
+- ตอนเซฟ เกมวาดภาพแปลงบ้านลง render target 1360×804 สองตัวกับ 680×400 สองตัว (สี B8G8R8A8 + depth) แล้วอ่านกลับด้วย `vkCmdCopyImageToBuffer` เพื่อทำรูปใน `HouseNN.iff` (`BMP_` 512/513 ขนาด ~224×114 และ 1024/1025 ~112×58 คู่ละรูปสีกับ mask)
+- target พวกนี้เล็กกว่าจอจึงโดนขยาย เกมเลยได้แค่มุมซ้ายบน 1/9 → แปลงบ้านหายจากหน้าละแวกบ้านและคลิกไม่ได้ (การคลิกใช้รูปนี้)
+- แก้: ถ้าอ่านจาก image ที่ขยาย DLL จะ blit แบบ nearest (ได้พิกเซลกลางของแต่ละบล็อก 3×3 = ภาพที่เกมจะวาดที่ 1×) ลง image 1× ที่ cache ไว้ตามขนาด แล้วให้เกมอ่านจากตัวนั้น validation ไม่เจอ error
+- `vkCmdCopyImage`/`vkCmdBlitImage` จาก image ที่ขยายยังแค่ log ไว้ (ยังไม่เคยเจอ)
+- สีรูปแปลงบ้าน: ทดสอบ A/B เซฟบ้านเดียวกันสองครั้งติดกัน เปิด/ปิด 1b → สีเฉลี่ยตรงกัน (97,112,67) ต่างเฉพาะ noise ของหญ้า ที่ดูต่างจากเพื่อนบ้านเพราะรูปที่มากับเกม (`TemplateUserData`, เหมือนไฟล์ทุกไบต์) วาดด้วย engine เดิม พอเซฟ Legacy วาดใหม่ด้วย engine ของตัวเอง เป็นแบบนี้แม้ไม่มี mod
+
+### โลกในบ้าน (ข้อมูลสำหรับ Phase 4)
+
+fragment shader ที่วาดโลกในบ้าน (decompile ด้วย `spirv-cross`):
+
+- `63b9db14d8318909`: texture + แสงจุด 2 ดวง (ลดตามระยะ) + `gl_FragDepth` จาก vertex + `discard` ถ้า alpha ≤ 0 → sprite/พื้น/ผนัง
+- `0d913d451e5da14f`: สีจาก vertex ไม่มี texture, ความโปร่งใสแบบลายจุด 8×4 จาก `gl_FragCoord` (bitmask)
+- `28863a909755e6c1`: สีจาก vertex + `gl_FragDepth`
+
+xBR ทำได้ด้วยหลักเดียวกับ UI แต่ต้องเขียน shader แฝดที่ทำแสง ความลึก และ discard เหมือนเดิม และมีความเสี่ยงรอยต่อระหว่างแผ่นพื้น/ผนัง
+
+### วิธีทดสอบที่ใช้
+
+- เปิด `Sims.exe` ตรงๆ (มี `steam_appid.txt`) พร้อม env var ของ DLL, log ที่ `%VKPROXY_DIR%\vkproxy.log` (ค่าเริ่มต้น `%TEMP%\vkproxy`)
+- validation: `VK_LAYER_PATH=C:\VulkanSDK\1.3.296.0\Bin32`, `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, `VK_LAYER_SETTINGS_PATH=<ไฟล์>` ที่มี `khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG` และ `khronos_validation.log_filename = <ไฟล์ log>`
+- trace เฟรม: F11 ในเกม หรือสร้างไฟล์ `trace.now` ในโฟลเดอร์ log (ห้ามส่งปุ่มเข้าเกมจากสคริปต์ เพราะจะไปโดนหน้าต่างอื่นที่ focus อยู่)
+- ก่อนให้เซฟระหว่างทดสอบ สำรอง `UserData` ทั้งโฟลเดอร์ แล้วกู้คืนด้วย `robocopy /MIR` และตรวจขนาด/เวลาไฟล์ทุกไฟล์
+
 ## วิธีทำซ้ำ (เมื่อ EA อัปเดตเกม)
 
 1. `python tools\inventory.py <game> -o work\inventory.md` และ `python tools\exe_strings.py <game>\Sims.exe -o work\strings.md`
@@ -151,3 +205,6 @@
 - `backup\SavedGames-The Sims 25\` สำเนาข้อมูลผู้เล่น (7,122 ไฟล์, 544 MB) สำรองหลังการเปิดเกมทดสอบครั้งแรก
 - `work\inventory.md`, `work\strings*.md`, `work\far_uigraphics.txt`
 - `work\Sims_mem.bin` (memory dump), `work\dis_*.txt` (disassembly)
+- `work\vkproxy\` log, shader ที่ dump, `replace\` (atlas HD), `vl\` (validation), log ของรอบที่ค้าง (`crash_*.log`)
+- `work\fonts\` (.ffn ที่แตกจาก FAR), `work\mock\` (ภาพเทียบ), `work\thumbs\`, `work\ab\` (รูปแปลงบ้านที่ใช้เทียบ)
+- `work\save_backup_*`, `work\save_*` สำเนาเซฟก่อน/หลังการทดสอบแต่ละรอบ

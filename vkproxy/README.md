@@ -21,7 +21,13 @@ instead of the system loader. It forwards every call to the real loader
   `vkproxy\replace\<w>x<h>_<hash>@<scale>.bgra` (made by `tools/hd_art.py` from the
   user's own game files: HD object sprites), keeps an HD twin image and binds it for the
   draws that sample that texture. The game's own image is untouched; textures without a
-  file keep xBR.
+  file keep xBR. Twins are kept by content after the game's image goes, so turning the
+  camera back to a view reuses them (idle twins: up to a quarter of the GPU memory, at
+  most 2 GB, longest idle dropped first).
+
+The log has a `perf:` line for each frame that uploads textures or takes over 40 ms:
+time spent hashing uploads, reading replacement files and allocating, and how many twins
+are shown, kept and idle.
 
 ## Build
 

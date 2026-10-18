@@ -28,10 +28,14 @@
 #include <vulkan/vulkan.h>
 #include <windows.h>
 
+#include <cpuid.h>
+#include <immintrin.h>
+
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
@@ -96,6 +100,29 @@ struct Staging {
     VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 VkShaderModule g_xbr_module = VK_NULL_HANDLE;
+// Time the proxy spends on texture uploads, per frame: logged ("perf:") for every frame
+// that uploads textures or takes longer than kSlowFrameMs, to find what makes turning
+// and zooming the camera slow.
+struct Perf {
+    double copy = 0;    // all of vkCmdCopyBufferToImage, the parts below included
+    double hash = 0;    // content names of uploads
+    double alloc = 0;   // staging buffers: create, allocate, map
+    double file = 0;    // reading replacement files
+    double image = 0;   // HD twin images: create, allocate, view
+    double submit = 0;  // vkQueueSubmit
+    unsigned uploads = 0, hashed = 0, loaded = 0, reused = 0;
+    double mb = 0;      // replacement bytes read
+};
+Perf g_perf;
+double g_ms_per_tick = 0;
+double g_last_present_ms = 0;
+unsigned g_perf_lines = 0;
+const double kSlowFrameMs = 40;
+double now_ms() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<double>(t.QuadPart) * g_ms_per_tick;
+}
 
 void logf(const char* fmt, ...) {
     if (!g_log) return;
@@ -142,6 +169,9 @@ void init() {
         }
         g_dir = buf;
         g_replace_dir = dir_set ? g_dir + "\\replace" : dll_folder() + "\\vkproxy\\replace";
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        g_ms_per_tick = 1000.0 / static_cast<double>(freq.QuadPart);
         CreateDirectoryA(g_dir.c_str(), nullptr);
         g_log = fopen((g_dir + "\\vkproxy.log").c_str(), "w");
         if (GetEnvironmentVariableA("VKPROXY_XBR", buf, MAX_PATH) && buf[0] == '0') g_xbr_on = false;
@@ -234,9 +264,24 @@ struct HdImage {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     std::string name;
+    VkDeviceSize bytes = 0;
 };
-std::unordered_map<uint64_t, HdImage> g_hd;               // game VkImage -> HD twin
-std::vector<HdImage> g_hd_retired;                         // replaced by a re-upload; freed with the device
+std::unordered_map<uint64_t, HdImage> g_hd;               // game VkImage -> the HD twin it shows
+// HD twins by content name. The game destroys a camera view's sprites when the camera
+// turns or zooms and uploads them again when it comes back, so a twin no image shows any
+// more is kept for reuse (no file read, no allocation), until the idle ones go over
+// budget: then the longest idle go first.
+struct Twin {
+    HdImage hd;
+    unsigned users = 0;  // game images showing it
+    unsigned seq = 0;    // bumped on every acquire and release: tells stale queue entries
+};
+std::unordered_map<std::string, Twin> g_twins;
+std::deque<std::tuple<std::string, unsigned, unsigned>> g_released;  // (name, seq, frame) of recent releases
+std::deque<std::pair<std::string, unsigned>> g_idle;                 // (name, seq): idle, out of flight, oldest first
+VkDeviceSize g_idle_bytes = 0;
+VkDeviceSize g_twin_budget = 512ull << 20;  // set from the GPU's memory in hk_vkCreateDevice
+unsigned g_idle_count = 0, g_idle_max = 2048;
 std::set<std::string> g_hd_names;                          // "<w>x<h>_<hash>" with a file
 std::set<std::pair<uint32_t, uint32_t>> g_hd_sizes;        // sizes worth hashing
 bool g_hd_scanned = false;
@@ -416,6 +461,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateImage(VkDevice d, const VkImageCreateI
 }
 
 void free_hd(HdImage& hd);
+void release_twin(const std::string& name);
 
 // Drivers reuse handle values once an object is destroyed (the validation layer
 // hides this by wrapping handles). A stale replacement entry made the next image
@@ -427,8 +473,8 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyImage(VkDevice d, VkImage image, const Vk
         g_image_name.erase((uint64_t)image);
         if (g_replace.erase((uint64_t)image)) g_freed_replaced.insert((uint64_t)image);
         auto hd = g_hd.find((uint64_t)image);
-        if (hd != g_hd.end()) {  // used by the same submissions as the game's image, so done with too
-            free_hd(hd->second);
+        if (hd != g_hd.end()) {  // kept for reuse (see Twin)
+            release_twin(hd->second.name);
             g_hd.erase(hd);
         }
     }
@@ -1142,13 +1188,51 @@ const unsigned char* upload_pixels(VkBuffer src, VkImage dst, uint32_t n, const 
     return reinterpret_cast<unsigned char*>(mm->second.ptr + (start - mm->second.offset));
 }
 
+// Copy out of mapped memory with streaming 16-byte loads. The game's staging memory
+// is not host-cached (write-combined): read a byte at a time it gave ~11 MB/s, 1.85 ms
+// per sprite and 1.8 s of every camera turn.
+__attribute__((target("sse4.1"))) void copy_streaming(unsigned char* dst, const unsigned char* src, size_t n) {
+    size_t i = 0;
+    for (; i < n && (reinterpret_cast<uintptr_t>(src + i) & 15); ++i) dst[i] = src[i];
+    for (; i + 64 <= n; i += 64) {
+        __m128i* s = reinterpret_cast<__m128i*>(const_cast<unsigned char*>(src + i));
+        __m128i a = _mm_stream_load_si128(s), b = _mm_stream_load_si128(s + 1);
+        __m128i c = _mm_stream_load_si128(s + 2), d = _mm_stream_load_si128(s + 3);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), a);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i + 16), b);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i + 32), c);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i + 48), d);
+    }
+    for (; i + 16 <= n; i += 16)
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
+                         _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<unsigned char*>(src + i))));
+    for (; i < n; ++i) dst[i] = src[i];
+}
+
+void copy_from_mapped(unsigned char* dst, const unsigned char* src, size_t n) {
+    static const bool sse41 = [] {
+        unsigned a, b, c, d;
+        return __get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSE4_1);
+    }();
+    if (sse41)
+        copy_streaming(dst, src, n);
+    else
+        memcpy(dst, src, n);
+}
+
+std::vector<unsigned char> g_name_buf;  // cached copy of the pixels being named
+
 // "<w>x<h>_<hash of the pixels>": names dumps and content replacements. The
 // hash is FNV-1a 64 with 1469598103934665603 as offset basis (the standard
 // basis lost its last digit); every dump, replacement file and the shader name
 // kQuadFragShader depend on it, so it stays (tools/spr2.py matches it).
-std::string content_name(const ImageInfo& ii, const unsigned char* p) {
+std::string content_name(const ImageInfo& ii, const unsigned char* mapped) {
+    size_t size = 4ull * ii.w * ii.h;
+    g_name_buf.resize(size);
+    copy_from_mapped(g_name_buf.data(), mapped, size);
+    const unsigned char* p = g_name_buf.data();
     uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0, size = 4ull * ii.w * ii.h; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    for (size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
     char name[64];
     snprintf(name, sizeof name, "%ux%u_%016llx", ii.w, ii.h, static_cast<unsigned long long>(h));
     return name;
@@ -1206,6 +1290,7 @@ Staging load_staging(const Replacement& rp) {
     auto map = reinterpret_cast<PFN_vkMapMemory>(device_fn("vkMapMemory"));
     if (!create_buffer || !requirements || !allocate || !bind || !map) return st;
 
+    double t0 = now_ms();
     VkDeviceSize size = 4ull * rp.w * rp.h;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
@@ -1223,10 +1308,15 @@ Staging load_staging(const Replacement& rp) {
     size_t got = 0;
     if (st.memory && bind(g_device, st.buffer, st.memory, 0) == VK_SUCCESS &&
         map(g_device, st.memory, 0, size, 0, &ptr) == VK_SUCCESS) {
+        double t1 = now_ms();
+        g_perf.alloc += t1 - t0;
         if (FILE* f = fopen(rp.path.c_str(), "rb")) {
             got = fread(ptr, 1, static_cast<size_t>(size), f);
             fclose(f);
         }
+        g_perf.file += now_ms() - t1;
+        g_perf.mb += got / 1048576.0;
+        ++g_perf.loaded;
     }
     if (got != size) {
         logf("replace: could not read %s (%u bytes)", rp.path.c_str(), static_cast<unsigned>(got));
@@ -1284,19 +1374,21 @@ void scan_hd_files() {
     logf("hd: %u content replacements in %s", static_cast<unsigned>(g_hd_names.size()), g_replace_dir.c_str());
 }
 
-void free_hd(HdImage& hd) {
+// The descriptor sets made for draws with a twin (hd_bind_for); made again when needed.
+void free_hd_sets(VkImageView view) {
     auto free_sets = reinterpret_cast<PFN_vkFreeDescriptorSets>(device_fn("vkFreeDescriptorSets"));
+    auto it = g_hd_sets.lower_bound(std::make_tuple((uint64_t)view, uint64_t{0}, uint64_t{0}));
+    while (it != g_hd_sets.end() && std::get<0>(it->first) == (uint64_t)view) {
+        if (free_sets && g_hd_pool) free_sets(g_device, g_hd_pool, 1, &it->second);
+        it = g_hd_sets.erase(it);
+    }
+}
+
+void free_hd(HdImage& hd) {
     auto destroy_view = reinterpret_cast<PFN_vkDestroyImageView>(device_fn("vkDestroyImageView"));
     auto destroy_image = reinterpret_cast<PFN_vkDestroyImage>(device_fn("vkDestroyImage"));
     auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(device_fn("vkFreeMemory"));
-    for (auto it = g_hd_sets.begin(); it != g_hd_sets.end();) {
-        if (std::get<0>(it->first) == (uint64_t)hd.view) {
-            if (free_sets && g_hd_pool) free_sets(g_device, g_hd_pool, 1, &it->second);
-            it = g_hd_sets.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    free_hd_sets(hd.view);
     if (hd.view && destroy_view) destroy_view(g_device, hd.view, nullptr);
     if (hd.image && destroy_image) destroy_image(g_device, hd.image, nullptr);
     if (hd.memory && free_memory) free_memory(g_device, hd.memory, nullptr);
@@ -1327,6 +1419,7 @@ HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
     }
     VkMemoryRequirements req;
     requirements(g_device, hd.image, &req);
+    hd.bytes = req.size;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1343,6 +1436,48 @@ HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
     return hd;
 }
 
+void acquire_twin(Twin& t) {
+    if (t.users++ == 0) {
+        g_idle_bytes -= t.hd.bytes;
+        --g_idle_count;
+        ++t.seq;
+    }
+}
+
+// A game image no longer shows the twin: when nobody does, it goes idle (kept for reuse).
+void release_twin(const std::string& name) {
+    auto t = g_twins.find(name);
+    if (t == g_twins.end() || t->second.users == 0 || --t->second.users) return;
+    ++t->second.seq;
+    g_idle_bytes += t->second.hd.bytes;
+    ++g_idle_count;
+    g_released.emplace_back(name, t->second.seq, g_frame);
+}
+
+// Once per present. A released twin may still be read by commands in flight, so only
+// kStagingFrames later are its descriptor sets freed (bounding the pool) and may it be
+// dropped; idle twins over budget are dropped longest idle first.
+void maintain_twins() {
+    while (!g_released.empty() && g_frame - std::get<2>(g_released.front()) > kStagingFrames) {
+        auto [name, seq, frame] = g_released.front();
+        g_released.pop_front();
+        auto t = g_twins.find(name);
+        if (t == g_twins.end() || t->second.users || t->second.seq != seq) continue;  // shown again since
+        free_hd_sets(t->second.hd.view);
+        g_idle.emplace_back(name, seq);
+    }
+    while ((g_idle_bytes > g_twin_budget || g_idle_count > g_idle_max) && !g_idle.empty()) {
+        auto [name, seq] = g_idle.front();
+        g_idle.pop_front();
+        auto t = g_twins.find(name);
+        if (t == g_twins.end() || t->second.users || t->second.seq != seq) continue;
+        g_idle_bytes -= t->second.hd.bytes;
+        --g_idle_count;
+        free_hd(t->second.hd);
+        g_twins.erase(t);
+    }
+}
+
 // For each upload into a sampled texture: when its pixels have a replacement
 // file, record (into cb, after the game's own copy) the fill of an HD twin.
 void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
@@ -1355,13 +1490,25 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     std::string name;
     const ImageInfo* info = nullptr;
     if (g_hd_sizes.count({im->second.w, im->second.h}))
-        if (const unsigned char* p = upload_pixels(src, dst, n, r, &info)) name = content_name(*info, p);
+        if (const unsigned char* p = upload_pixels(src, dst, n, r, &info)) {
+            double t0 = now_ms();
+            name = content_name(*info, p);
+            g_perf.hash += now_ms() - t0;
+            ++g_perf.hashed;
+        }
     if (existing != g_hd.end()) {
         if (existing->second.name == name) return;  // same pixels again: the twin is still right
-        g_hd_retired.push_back(existing->second);   // new pixels; old twin may still be in flight
+        release_twin(existing->second.name);        // new pixels; the old twin may still be in flight
         g_hd.erase(existing);
     }
     if (name.empty() || !g_hd_names.count(name)) return;
+    auto cached = g_twins.find(name);
+    if (cached != g_twins.end()) {  // shown before (or by another image now): filled already
+        acquire_twin(cached->second);
+        g_hd[(uint64_t)dst] = cached->second.hd;
+        ++g_perf.reused;
+        return;
+    }
     const ImageInfo& ii = *info;
     Replacement rp{g_replace_dir + "\\" + name + "@" + std::to_string(g_layer_scale) + ".bgra",
                    ii.w * g_layer_scale, ii.h * g_layer_scale};
@@ -1371,7 +1518,9 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     if (!st.buffer) return;
     g_staging_retire.push_back({st, g_frame});
     VkBuffer staged = st.buffer;
+    double t0 = now_ms();
     HdImage hd = make_hd(ii, g_layer_scale, name);
+    g_perf.image += now_ms() - t0;
     if (!hd.image) return;
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     b.srcAccessMask = 0;
@@ -1392,12 +1541,24 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     g_hd[(uint64_t)dst] = hd;
+    Twin& t = g_twins[name];
+    t.hd = hd;
+    t.users = 1;
     static unsigned logged = 0;
     if (logged++ < 100) logf("hd: img#%u %s -> %ux%u twin", ii.id, name.c_str(), rp.w, rp.h);
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
                                                      VkImageLayout dl, uint32_t n, const VkBufferImageCopy* r) {
+    double t0 = now_ms();
+    struct Timed {
+        double t0;
+        ~Timed() {
+            std::lock_guard<std::recursive_mutex> lk(g_mu);
+            g_perf.copy += now_ms() - t0;
+            ++g_perf.uploads;
+        }
+    } timed{t0};
     VkBuffer staged = VK_NULL_HANDLE;
     uint32_t w = 0, h = 0;
     {
@@ -1561,10 +1722,13 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
         free_retired_staging(true);
         for (auto& rb : g_readback) free_readback(rb.second);
         g_readback.clear();
-        for (auto& hd : g_hd) free_hd(hd.second);
+        for (auto& t : g_twins) free_hd(t.second.hd);  // g_hd only points at these
+        g_twins.clear();
         g_hd.clear();
-        for (auto& hd : g_hd_retired) free_hd(hd);
-        g_hd_retired.clear();
+        g_released.clear();
+        g_idle.clear();
+        g_idle_bytes = 0;
+        g_idle_count = 0;
         auto destroy_pool = reinterpret_cast<PFN_vkDestroyDescriptorPool>(device_fn("vkDestroyDescriptorPool"));
         if (g_hd_pool && destroy_pool) destroy_pool(d, g_hd_pool, nullptr);
         g_hd_pool = VK_NULL_HANDLE;
@@ -1707,7 +1871,12 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueueSubmit(VkQueue q, uint32_t n, const VkS
             for (uint32_t i = 0; i < n; ++i)
                 for (uint32_t k = 0; k < s[i].commandBufferCount; ++k) write_world_draws(s[i].pCommandBuffers[k]);
     }
+    double t0 = now_ms();
     VkResult r = real_vkQueueSubmit(q, n, s, f);
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        g_perf.submit += now_ms() - t0;
+    }
     if (r != VK_SUCCESS) {
         static unsigned logged = 0;
         if (logged++ < 20) logf("ERROR vkQueueSubmit -> %d at frame %u", static_cast<int>(r), g_frame);
@@ -1723,7 +1892,20 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
         if (logged++ < 20) logf("ERROR vkQueuePresentKHR -> %d at frame %u", static_cast<int>(r), g_frame);
     }
     ++g_frame;
+    double now = now_ms(), frame_ms = g_last_present_ms ? now - g_last_present_ms : 0;
+    g_last_present_ms = now;
+    if ((g_perf.uploads || frame_ms > kSlowFrameMs) && g_perf_lines < 20000) {
+        ++g_perf_lines;
+        logf("perf: frame %u %.1f ms; %u uploads %.1f ms: hash %.1f (%u), reused %u, files %.1f (%u, %.1f MB), "
+             "staging %.1f, twins %.1f; submit %.1f; shown %u, twins %u (idle %u, %.0f MB), staging %u",
+             g_frame, frame_ms, g_perf.uploads, g_perf.copy, g_perf.hash, g_perf.hashed, g_perf.reused, g_perf.file,
+             g_perf.loaded, g_perf.mb, g_perf.alloc, g_perf.image, g_perf.submit, static_cast<unsigned>(g_hd.size()),
+             static_cast<unsigned>(g_twins.size()), g_idle_count, g_idle_bytes / 1048576.0,
+             static_cast<unsigned>(g_staging_retire.size()));
+    }
+    g_perf = Perf{};
     if (!g_staging_retire.empty()) free_retired_staging(false);
+    maintain_twins();
     if (g_trace) {
         logf("== end of traced frame %u (%u xbr draws)", g_frame, g_xbr_draws);
         g_trace = false;
@@ -1805,6 +1987,29 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateDevice(VkPhysicalDevice pd, const VkDe
     if (r == VK_SUCCESS) {
         g_phys = pd;
         g_device = *out;
+        // idle HD twins kept for reuse: a quarter of the largest GPU-local heap, at most
+        // 2 GB, and half the driver's allocation count (each twin is one allocation)
+        auto mem_props = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+            real_GIPA(g_instance, "vkGetPhysicalDeviceMemoryProperties"));
+        auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            real_GIPA(g_instance, "vkGetPhysicalDeviceProperties"));
+        VkDeviceSize heap = 0;
+        if (mem_props) {
+            VkPhysicalDeviceMemoryProperties mp;
+            mem_props(pd, &mp);
+            for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
+                if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max(heap, mp.memoryHeaps[i].size);
+        }
+        if (heap) g_twin_budget = std::min<VkDeviceSize>(heap / 4, 2048ull << 20);
+        uint32_t max_allocs = 4096;
+        if (props) {
+            VkPhysicalDeviceProperties p;
+            props(pd, &p);
+            max_allocs = p.limits.maxMemoryAllocationCount;
+        }
+        g_idle_max = std::min<uint32_t>(max_allocs / 2, 8192);
+        logf("hd twins: idle budget %u MB, %u twins (GPU heap %u MB, at most %u allocations)",
+             static_cast<unsigned>(g_twin_budget >> 20), g_idle_max, static_cast<unsigned>(heap >> 20), max_allocs);
     }
     return r;
 }

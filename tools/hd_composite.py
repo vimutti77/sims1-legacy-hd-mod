@@ -17,9 +17,14 @@ Two steps around the AI upscaler (ai_upscale/):
                texture that is empty (= frontmost) outside the sprite, so a leaked
                pixel would draw through walls; tiles and object pieces still meet;
              - colour inside fully opaque areas comes from the upscaler (area-averaged
-               to 3x);
+               to 3x), pulled halfway back towards the original (back-projection:
+               the difference between the original and the 3x colour shrunk back to
+               1x is spread back bilinearly; the upscaler sometimes repaints small,
+               noisy sprites, e.g. a newspaper's print became folds);
              - where the original has partial alpha nearby (soft shadows, anti-aliased
-               edges) the original is sampled bilinearly instead.
+               edges) the original is sampled bilinearly instead, from its non-empty
+               texels only: an empty texel in the mix faded the edge, and where two
+               pieces of an object meet, the piece below showed through as a line.
 
 Both steps skip outputs that already exist and run on all CPU cores.
 
@@ -39,6 +44,8 @@ from pathlib import Path
 
 SCALE = 3
 SOLID = 128  # alpha at or above which a pixel counts as solid for mirroring
+BACKPROJECT = 0.5  # how far the upscaler's colour is pulled back to the original (0 = not, 1 = fully)
+BACKPROJECT_ITERS = 3
 
 
 def size_of(name: str) -> tuple[int, int]:
@@ -185,9 +192,58 @@ def shrink(w: int, h: int, rgba: bytes, ow: int, oh: int) -> bytearray:
     return out
 
 
-def composite(w0: int, h0: int, orig: bytes, ai3: bytes) -> bytearray:
+def up_weights(n: int) -> list[list[tuple[int, float]]]:
+    """Bilinear weights of each of SCALE*n outputs over n inputs (pixel centres, edges clamped)."""
+    out = []
+    for i in range(n * SCALE):
+        src = (i + 0.5) / SCALE - 0.5
+        j0 = int(src // 1)
+        t = src - j0
+        out.append([(min(max(j0, 0), n - 1), 1 - t), (min(max(j0 + 1, 0), n - 1), t)])
+    return out
+
+
+def backproject(w0: int, h0: int, orig: bytes, ai3: bytes, strength: float,
+                iters: int = BACKPROJECT_ITERS) -> bytearray:
+    """ai3 (straight RGBA at 3x) with its opaque texels' colour pulled towards the original:
+    iters times, the difference between each opaque original texel and the mean of its 3x3
+    block is spread back bilinearly; the result is strength of the way there."""
+    W, H = w0 * SCALE, h0 * SCALE
+    opaque = [orig[i * 4 + 3] == 255 for i in range(w0 * h0)]
+    cur = [float(ai3[(p // 3) * 4 + p % 3]) for p in range(W * H * 3)]  # RGB per 3x pixel
+    wx, wy = up_weights(w0), up_weights(h0)
+    for _ in range(iters):
+        res = [0.0] * (w0 * h0 * 3)
+        for ty in range(h0):
+            for tx in range(w0):
+                t = ty * w0 + tx
+                if not opaque[t]:
+                    continue
+                for c in range(3):
+                    s = sum(cur[((ty * SCALE + yy) * W + tx * SCALE + xx) * 3 + c]
+                            for yy in range(SCALE) for xx in range(SCALE))
+                    res[t * 3 + c] = orig[t * 4 + 2 - c] - s / (SCALE * SCALE)  # orig is BGRA
+        for y in range(H):
+            for x in range(W):
+                if not opaque[(y // SCALE) * w0 + x // SCALE]:
+                    continue
+                for c in range(3):
+                    v = sum(fy * fx * res[(jy * w0 + jx) * 3 + c] for jy, fy in wy[y] for jx, fx in wx[x])
+                    i = (y * W + x) * 3 + c
+                    cur[i] = min(255.0, max(0.0, cur[i] + v))
+    out = bytearray(ai3)
+    for p in range(W * H):
+        for c in range(3):
+            a = ai3[p * 4 + c]
+            out[p * 4 + c] = int(a + strength * (cur[p * 3 + c] - a) + 0.5)
+    return out
+
+
+def composite(w0: int, h0: int, orig: bytes, ai3: bytes, backproject_strength: float = BACKPROJECT) -> bytearray:
     """3x premultiplied BGRA from the original (premultiplied BGRA, w0 x h0) and the
     upscaler's result at 3x (straight RGBA). See the module docstring."""
+    if backproject_strength:
+        ai3 = backproject(w0, h0, orig, ai3, backproject_strength)
     W = w0 * SCALE
     soft = bytearray(w0 * h0)  # texel with a partially transparent pixel in its 3x3 neighbourhood
     for y in range(h0):
@@ -203,14 +259,23 @@ def composite(w0: int, h0: int, orig: bytes, ai3: bytes) -> bytearray:
                 continue
             o = (y * W + x) * 4
             if soft[sy * w0 + sx]:
+                # bilinear over the texels that are not empty: an empty one would fade the
+                # edge, and where two pieces of an object meet the piece below shows through
                 fx, fy = (x + 0.5) / SCALE - 0.5, (y + 0.5) / SCALE - 0.5
                 x0, y0 = min(max(int(fx // 1), 0), w0 - 1), min(max(int(fy // 1), 0), h0 - 1)
                 x1, y1 = min(w0 - 1, x0 + 1), min(h0 - 1, y0 + 1)
                 tx, ty = min(max(fx - x0, 0.0), 1.0), min(max(fy - y0, 0.0), 1.0)
+                taps = [(t, f) for t, f in (((y0 * w0 + x0) * 4, (1 - tx) * (1 - ty)), ((y0 * w0 + x1) * 4, tx * (1 - ty)),
+                                            ((y1 * w0 + x0) * 4, (1 - tx) * ty), ((y1 * w0 + x1) * 4, tx * ty))
+                        if orig[t + 3]]
+                total = 0.0  # added one by one: sum() of floats rounds differently from Python 3.12
+                for _t, f in taps:
+                    total += f
                 for c in range(4):
-                    v = (orig[(y0 * w0 + x0) * 4 + c] * (1 - tx) * (1 - ty) + orig[(y0 * w0 + x1) * 4 + c] * tx * (1 - ty)
-                         + orig[(y1 * w0 + x0) * 4 + c] * (1 - tx) * ty + orig[(y1 * w0 + x1) * 4 + c] * tx * ty)
-                    out[o + c] = int(v + 0.5)
+                    v = 0.0
+                    for t, f in taps:
+                        v += orig[t + c] * f
+                    out[o + c] = int(v / total + 0.5)
             else:  # fully opaque area: upscaler colour
                 i = (y * W + x) * 4
                 out[o:o + 4] = bytes((ai3[i + 2], ai3[i + 1], ai3[i], 255))

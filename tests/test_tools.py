@@ -194,6 +194,23 @@ class Spr2Tests(unittest.TestCase):
         self.assertEqual(name, spr2.content_name(3, 3, self.EXPECTED))
         self.assertIn("SPR2#100", where)
 
+    def test_spr2_palette_wins_over_the_frame_palette(self):
+        def palt(colours):
+            return struct.pack("<II", 1, len(colours)) + b"\0" * 8 + bytes(c for rgb in colours for c in rgb)
+
+        data = bytearray(make_spr2(1000))
+        struct.pack_into("<H", data, 16 + 8, 2)  # the frame header names palette 2
+        other = [(0, 0, 0), (0, 255, 0), (0, 255, 0), (0, 255, 0)]
+        iff_data = make_iff([("PALT", 1, "spr2's", palt(PALETTE)), ("PALT", 2, "frame's", palt(other)),
+                             ("SPR2", 100, "sprite", bytes(data))])
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp, "obj.iff")
+            p.write_bytes(iff_data)
+            (_name, _w, _h, tex, _where), = spr2.game_textures(p)
+        self.assertEqual(tex, self.EXPECTED)  # drawn with PALT 1, the SPR2 chunk's id
+        frame = spr2.decode_frame(bytes(data), 16)
+        self.assertEqual(spr2.frame_palette({2: other}, frame, 1), other)  # SPR2 id missing: frame id
+
     def test_rejects_broken_data(self):
         with self.assertRaises(spr2.Spr2Error):
             spr2.frame_offsets(b"\x00\x01")
@@ -242,17 +259,44 @@ class HdCompositeTests(unittest.TestCase):
         # 3x1 original (premultiplied BGRA): opaque, opaque, transparent
         orig = bytes([10, 20, 30, 255, 10, 20, 30, 255, 0, 0, 0, 0])
         ai3 = bytes([200, 100, 50, 255] * 9 * 3)  # upscaler says: a different colour, opaque everywhere
-        out = hd_composite.composite(3, 1, orig, ai3)
+        out = hd_composite.composite(3, 1, orig, ai3, backproject_strength=0)
         px = [tuple(out[i * 4:i * 4 + 4]) for i in range(9 * 3)]
         for y in range(3):
             row = px[y * 9:(y + 1) * 9]
             self.assertEqual(row[:6], [(50, 100, 200, 255)] * 6)  # AI colour, as BGRA, inside
             self.assertEqual(row[6:], [(0, 0, 0, 0)] * 3)  # never more coverage than the original
 
+    def test_backprojection_pulls_the_colour_back_to_the_original(self):
+        # 2x1 opaque original, red then blue (premultiplied BGRA); the upscaler made both grey
+        orig = bytes([0, 0, 200, 255, 200, 0, 0, 255])
+        ai3 = bytes([100, 100, 100, 255] * 6 * 3)
+
+        def block_means(out):  # mean RGB of each texel's 3x3 block
+            return [[sum(out[((y * 6) + tx * 3 + x) * 4 + c] for y in range(3) for x in range(3)) / 9
+                     for c in range(3)] for tx in range(2)]
+
+        full = block_means(hd_composite.backproject(2, 1, orig, ai3, 1.0, iters=20))
+        half = block_means(hd_composite.backproject(2, 1, orig, ai3, 0.5, iters=20))
+        for got, want in zip(full, ([200, 0, 0], [0, 0, 200])):
+            self.assertTrue(all(abs(g - w) <= 2 for g, w in zip(got, want)), full)  # shrinks back to the original
+        for got, want in zip(half, ([150, 50, 50], [50, 50, 150])):
+            self.assertTrue(all(abs(g - w) <= 2 for g, w in zip(got, want)), half)  # halfway there
+        self.assertEqual(hd_composite.backproject(2, 1, orig, ai3, 0.0), bytearray(ai3))
+
     def test_composite_samples_soft_areas_from_the_original(self):
         orig = bytes([0, 0, 0, 128, 0, 0, 0, 128])  # a 2x1 half-transparent shadow
         out = hd_composite.composite(2, 1, orig, bytes([255] * 6 * 3 * 4))
         self.assertTrue(all(out[i * 4:i * 4 + 4] == bytes([0, 0, 0, 128]) for i in range(18)))
+
+    def test_soft_edges_do_not_fade_into_empty_texels(self):
+        # 3x1: opaque grey, half-transparent grey, empty. The half-transparent texel keeps its
+        # alpha up to its edge; an empty neighbour would have faded it (the piece below an
+        # object's cut then showed through as a line).
+        orig = bytes([100, 100, 100, 255, 50, 50, 50, 128, 0, 0, 0, 0])
+        out = hd_composite.composite(3, 1, orig, bytes([100] * 9 * 3 * 4), backproject_strength=0)
+        alpha = [out[i * 4 + 3] for i in range(9)]  # first row of the 9x3 result
+        self.assertEqual(alpha[3:6], [170, 128, 128])  # blends towards the opaque side only
+        self.assertEqual(alpha[6:], [0, 0, 0])
 
     def test_shrink_is_an_area_average(self):
         # 4x1 -> 3x1: half red, half blue

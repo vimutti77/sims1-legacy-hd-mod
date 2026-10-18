@@ -4,14 +4,16 @@ Steps, each skipping work already done (so parts and interrupted runs resume):
   extract    decode the chosen objects' SPR2 frames exactly as Legacy uploads them
              into <work>/orig/<name>.bgra (name = what vkproxy matches)
   prep       straight alpha + mirrored fill -> <work>/in/<name>.png   (hd_composite)
-  upscale    ai_upscale/upscale.py --model M -> <work>/ai/<M>/        (needs the venv)
-  composite  -> <work>/hd/<M>/<name>@3.bgra                            (hd_composite)
-  install    copy the part's files into <game>/vkproxy/replace/  (--install)
-With --clean the part's AI outputs are deleted once composited (they are the
-largest intermediates; keep them only to re-run the composite step).
+  upscale    ai_upscale/upscale.py --model M --composite: AI, then the composite
+             step on the GPU -> <work>/hd/<M>/<name>@3.bgra            (needs the venv)
+  install    copy the part's new files into <game>/vkproxy/replace/  (--install)
+To try other composite rules on the AI output itself, run ai_upscale/upscale.py
+without --composite and tools/hd_composite.py composite by hand.
 
 A part is a category of objects within a pack:
-  --pack      base | ep1 ... ep7 | deluxe | shared   (default base)
+  --pack      base | ep1 ... ep7 | deluxe | shared | downloads (Downloads/: Maxis' free
+              objects and custom content; also loose GameData/Objects/*.iff) |
+              global (GameData/Global, Sprites.iff) | all   (default base)
   --category  seating surfaces appliances electronics plumbing decorative lighting misc
               (buy-mode category from the object's OBJD) | build | outdoor | other
               (objects without a buy-mode category, split by file name) | all
@@ -21,7 +23,8 @@ their own treatment.
 
 Usage:
     py tools/hd_art.py --game <dir> --list                    frames per category
-    py tools/hd_art.py --game <dir> --category seating [--model ultrasharp-v2] [--install] [--clean]
+    py tools/hd_art.py --game <dir> --category seating [--model ultrasharp-v2] [--install]
+    py tools/hd_art.py --game <dir> --pack all --category all --install   everything
 Close the game before running: the upscaler uses the GPU.
 """
 from __future__ import annotations
@@ -31,6 +34,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -45,11 +49,14 @@ BUY_CATEGORIES = {1: "seating", 2: "surfaces", 4: "appliances", 8: "electronics"
 BUILD_NAMES = ("door", "window", "stair", "fireplace", "column", "shutter", "pooldiv", "poolladder", "fence",
                "arch", "railing")
 OUTDOOR_NAMES = ("tree", "shrub", "flower", "mailbox", "trashoutside", "urn", "hedge", "bush")
-PACKS = {
+PACKS = {  # glob patterns under the install folder
     "base": ["GameData/Objects/Objects.far"],
     "deluxe": ["Deluxe/Deluxe.far"],
     "shared": ["ExpansionShared/ExpansionShared.far"],
     **{f"ep{n}": [f"ExpansionPack{n if n > 1 else ''}/ExpansionPack{n if n > 1 else ''}.far"] for n in range(1, 8)},
+    # Maxis' free download objects shipped with Legacy, and the player's own custom content
+    "downloads": ["Downloads/**/*.far", "Downloads/**/*.iff", "GameData/Objects/*.iff"],
+    "global": ["GameData/Global/Global.far", "GameData/Sprites.iff"],
 }
 CATEGORIES = sorted(set(BUY_CATEGORIES.values())) + ["build", "outdoor", "other"]
 
@@ -73,11 +80,9 @@ def category_of(name: str, data: bytes, chunks: list) -> str:
 
 
 def object_files(game: Path, pack: str):
-    """(file name, bytes, chunks, category) of every object IFF in the pack."""
-    for rel in PACKS[pack]:
-        path = game / rel
-        if not path.exists():
-            continue
+    """(file name, bytes, chunks, category) of every object IFF in the pack ("all": every pack)."""
+    patterns = [p for k in (PACKS if pack == "all" else [pack]) for p in PACKS[k]]
+    for path in (path for pattern in patterns for path in sorted(game.glob(pattern))):
         for name, data in spr2.iter_iffs(path):
             if Path(name).name.lower() == "floors.iff":
                 continue
@@ -105,7 +110,7 @@ def frames(data: bytes, chunks: list):
                 f = spr2.decode_frame(s, off)
             except (spr2.Spr2Error, struct.error):
                 continue
-            pal = pals.get(f.palette_id) or pals.get(default_pal)
+            pal = spr2.frame_palette(pals, f, default_pal)
             if pal and f.w and f.h:
                 tex = spr2.game_texture(f, pal)
                 yield spr2.content_name(f.w, f.h, tex), tex
@@ -123,15 +128,15 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Build HD object sprites for vkproxy, one part at a time.")
     ap.add_argument("--game", type=Path, required=True)
     ap.add_argument("--work", type=Path, default=REPO / "work" / "hd_art")
-    ap.add_argument("--pack", choices=sorted(PACKS), default="base")
+    ap.add_argument("--pack", choices=sorted(PACKS) + ["all"], default="base")
     ap.add_argument("--category", choices=CATEGORIES + ["all"])
     ap.add_argument("--files", nargs="*", default=[], help="only object files containing one of these strings")
     ap.add_argument("--model", default="ultrasharp-v2", help="name in ai_upscale/models.json or a model file")
     ap.add_argument("--python", type=Path, default=REPO / "work" / "ext" / "torch" / "Scripts" / "python.exe",
                     help="python of the ai_upscale venv")
     ap.add_argument("--install", action="store_true", help="copy the part's HD files into <game>/vkproxy/replace")
-    ap.add_argument("--clean", action="store_true",
-                    help="delete the part's AI outputs once composited (large; only needed to re-composite)")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="upscaler processes sharing the GPU (fewer if memory is short)")
     ap.add_argument("--list", action="store_true", help="frames per category in the pack, then exit")
     args = ap.parse_args(argv)
 
@@ -147,11 +152,16 @@ def main(argv: list[str]) -> int:
     if not args.category:
         ap.error("--category is required (or --list)")
 
+    t0 = [time.time()]
+
+    def lap() -> str:
+        t, t0[0] = t0[0], time.time()
+        return f"{t0[0] - t:.0f} s"
+
     orig = args.work / "orig"
     pngs = args.work / "in"
-    ai = args.work / "ai" / Path(args.model).stem
     hd = args.work / "hd" / Path(args.model).stem
-    for d in (orig, pngs, ai, hd):
+    for d in (orig, pngs, hd):
         d.mkdir(parents=True, exist_ok=True)
 
     # 1. extract
@@ -170,55 +180,41 @@ def main(argv: list[str]) -> int:
             if not (orig / f"{cname}.bgra").exists():
                 (orig / f"{cname}.bgra").write_bytes(tex)
     print(f"part {args.pack}/{args.category}{' ' + ','.join(args.files) if args.files else ''}: "
-          f"{len(names)} distinct textures")
+          f"{len(names)} distinct textures ({lap()})")
     (args.work / f"part_{args.pack}_{args.category}.txt").write_text("\n".join(names) + "\n")
 
     # 2. prep
     jobs = [(orig / f"{n}.bgra", pngs / f"{n}.png") for n in names if not (pngs / f"{n}.png").exists()]
-    print(f"prep: {hd_composite.run_all(jobs, hd_composite.prep_one)} new")
+    print(f"prep: {hd_composite.run_all(jobs, hd_composite.prep_one)} new ({lap()})")
 
-    # 3. upscale (only this part's images)
-    todo = [n for n in names if not (ai / f"{n}.png").exists() and not (hd / f"{n}@3.bgra").exists()]
+    # 3. upscale + composite (only this part's images)
+    todo = [n for n in names if not (hd / f"{n}@3.bgra").exists()]
     if todo:
         if game_running():
             print("The game is running: close it before upscaling (GPU).")
             return 1
-        part_in = args.work / "in_part"
-        if part_in.exists():
-            shutil.rmtree(part_in)
-        part_in.mkdir()
-        for n in todo:
-            shutil.copyfile(pngs / f"{n}.png", part_in / f"{n}.png")
+        todo_file = args.work / "todo.txt"
+        todo_file.write_text("\n".join(todo) + "\n", encoding="utf-8")
         cmd = [str(args.python), "-W", "ignore", str(REPO / "ai_upscale" / "upscale.py"), "--model", args.model,
-               str(part_in), str(ai)]
+               "--composite", str(orig), "--names", str(todo_file), "--workers", str(args.workers),
+               str(pngs), str(hd)]
         print("upscale:", " ".join(cmd), flush=True)
         if subprocess.run(cmd).returncode != 0:
             return 1
-        shutil.rmtree(part_in)
+        todo_file.unlink()
+        print(f"upscale: {lap()}")
 
-    # 4. composite
-    jobs = [(orig / f"{n}.bgra", ai / f"{n}.png", hd / f"{n}@3.bgra") for n in names
-            if (ai / f"{n}.png").exists() and not (hd / f"{n}@3.bgra").exists()]
-    print(f"composite: {hd_composite.run_all(jobs, hd_composite.composite_one)} new")
-    if args.clean:
-        n = 0
-        for name in names:
-            if (hd / f"{name}@3.bgra").exists() and (ai / f"{name}.png").exists():
-                (ai / f"{name}.png").unlink()
-                n += 1
-        print(f"clean: removed {n} AI outputs")
-
-    # 5. install
+    # 4. install (files that are new or rebuilt since the last install)
     if args.install:
         dest = args.game / "vkproxy" / "replace"
         dest.mkdir(parents=True, exist_ok=True)
         n = 0
         for name in names:
-            src = hd / f"{name}@3.bgra"
-            if src.exists():
-                shutil.copyfile(src, dest / src.name)
+            src, dst = hd / f"{name}@3.bgra", dest / f"{name}@3.bgra"
+            if src.exists() and (not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime):
+                shutil.copyfile(src, dst)
                 n += 1
-        print(f"installed {n} HD textures into {dest} (restart the game to load them)")
+        print(f"installed {n} HD textures into {dest} ({lap()}; restart the game to load them)")
     return 0
 
 

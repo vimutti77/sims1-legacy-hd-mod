@@ -11,11 +11,14 @@ SPR2 chunk (little-endian, after FreeSO's documentation):
         0  a row: count bytes including the marker, holding pixel runs
              1  count pixels of (z, colour index)
              2  count pixels of (z, colour index, alpha 0-31), padded to even
+                (z = the pixel's depth, 0 nearest; Frame.z)
              3  count transparent pixels
              6  count pixels of colour index, padded to even
         4  skip count rows
         5  end of the sprite
 PALT chunk (palette): u32 version, u32 entry count, 8 reserved bytes, R G B entries.
+A frame is drawn with the SPR2 chunk's palette id, not the one in its own header
+(frame_palette).
 
 Legacy uploads each frame as a premultiplied B8G8R8A8 texture (checked byte for
 byte against 1,245 uploads of the running game): colour -> RGB565, times alpha
@@ -32,7 +35,7 @@ from __future__ import annotations
 
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -53,6 +56,8 @@ class Frame:
     transparent: int
     # per pixel, row by row: None (nothing drawn) or (colour index, alpha 0-31 or None)
     pixels: list
+    # per pixel, row by row: z-buffer byte (0 = nearest), 255 where the frame has none
+    z: list = field(default_factory=list)
 
 
 def read_palettes(data: bytes, chunks: list[iff.IffChunk]) -> dict[int, list[tuple[int, int, int]]]:
@@ -94,6 +99,7 @@ def decode_frame(spr2: bytes, offset: int) -> Frame:
         raise Spr2Error("frame header out of range")
     w, h, flags, pal, transparent, _y, _x = struct.unpack_from("<HHIHHHH", spr2, offset)
     px: list = [None] * (w * h)
+    z = [255] * (w * h)
     pos, y, end_of_data = offset + 16, 0, len(spr2)
     while pos + 2 <= end_of_data:
         (marker,) = struct.unpack_from("<H", spr2, pos)
@@ -113,6 +119,8 @@ def decode_frame(spr2: bytes, offset: int) -> Frame:
                         if x < w and y < h:
                             px[y * w + x] = (spr2[pos + 1], spr2[pos + 2]) if rcmd == 2 else \
                                             (spr2[pos + 1], None) if rcmd == 1 else (spr2[pos], None)
+                            if rcmd != 6:
+                                z[y * w + x] = spr2[pos]
                         pos += size
                         x += 1
                     pos += (n * size) % 2  # runs are padded to an even length
@@ -128,7 +136,15 @@ def decode_frame(spr2: bytes, offset: int) -> Frame:
             break
         else:
             raise Spr2Error(f"unknown row command {cmd}")
-    return Frame(w, h, flags, pal, transparent, px)
+    return Frame(w, h, flags, pal, transparent, px, z)
+
+
+def frame_palette(pals: dict, frame: Frame, spr2_palette: int) -> Optional[list]:
+    """The palette the game draws a frame with: the SPR2 chunk's palette id. The frame
+    header has its own id, but the game ignores it (checked against uploads of the running
+    game: 124 of 124 frames whose two ids differ were drawn with the SPR2 one; many frame
+    ids are garbage). Only when the SPR2 id has no PALT is the frame id tried."""
+    return pals.get(spr2_palette) or pals.get(frame.palette_id)
 
 
 def game_texture(frame: Frame, palette: list[tuple[int, int, int]]) -> bytes:
@@ -195,7 +211,7 @@ def game_textures(path: Path) -> Iterator[tuple[str, int, int, bytes, str]]:
                     f = decode_frame(spr2, off)
                 except (Spr2Error, struct.error):
                     continue
-                pal: Optional[list] = pals.get(f.palette_id) or pals.get(default_pal)
+                pal = frame_palette(pals, f, default_pal)
                 if pal is None or f.w == 0 or f.h == 0:
                     continue
                 tex = game_texture(f, pal)

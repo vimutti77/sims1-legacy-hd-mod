@@ -14,7 +14,8 @@ This mod:
 - **smooths the remaining bitmaps** (icons, buttons) with xBR instead of blocky
   nearest-neighbour enlargement;
 - **replaces object sprites** (furniture, plants, doors, …) with versions upscaled by an
-  AI model, made from your own game files.
+  AI model, made from your own game files;
+- **redraws the Buy/Build catalogue pictures** from those HD sprites.
 
 It works by a drop-in `vulkan-1.dll` placed next to `Sims.exe` (`vkproxy/`). No game file
 is modified, and the mod never ships EA assets: fonts and sprites are generated on your
@@ -50,18 +51,22 @@ py tools\font_atlas.py $game "$game\vkproxy\replace"
 
 # 3. HD object sprites, one part at a time (optional; needs the ai_upscale venv)
 py tools\hd_art.py --game $game --list                       # parts and their size
-py tools\hd_art.py --game $game --category seating --install --clean
-py tools\hd_art.py --game $game --pack ep1 --category all --install --clean
+py tools\hd_art.py --game $game --category seating --install
+py tools\hd_art.py --game $game --pack ep1 --category all --install
+
+# 4. HD catalogue pictures, drawn from the HD sprites (optional; needs numpy)
+py catalog\build.py --game $game --install
 ```
 
 Start the game from Steam as usual. To uninstall, delete `vulkan-1.dll` and the
 `vkproxy` folder from the game folder.
 
 `hd_art.py` resumes where it stopped and skips parts already done. The whole game
-(base, ep1–ep7, deluxe, shared) is about 86,000 sprites: roughly 2 hours on an RTX 5090
-and 11.5 GB in the game folder. The work folder (`work\hd_art`) holds another copy of the
-HD files plus the originals (about 13 GB); `--clean` deletes the AI outputs, the largest
-intermediates, as each part finishes. Choose another model with `--model`
+(base, ep1–ep7, deluxe, shared) is about 86,000 sprites: roughly 1 hour on an RTX 5090
+(estimated from one part; slower GPUs take longer) and 11.5 GB in the game folder. The
+work folder (`work\hd_art`) holds another copy of the HD files plus the originals (about
+13 GB). Several upscaler processes share the GPU (`--workers`, default 4, fewer when
+memory is short: each one reserves 5–8 GB). Choose another model with `--model`
 (`py ai_upscale\upscale.py --list`).
 
 The HD files are not distributed: they are made from EA's art (and the fonts from
@@ -82,7 +87,8 @@ allowed and guaranteed to match.
 - Object outlines keep the original stair-step edge: the game reads each pixel's depth
   from a low-resolution z-buffer, so a sprite must not grow past its original shape.
 - Floors, walls, wallpapers, UI icons and Sims (3D models) are not HD yet.
-- Catalogue thumbnails are small (37×37) and stay soft.
+- 56 of the 1,406 catalogue pictures stay as they are: spells, magazines and objects
+  shown with contents the sprites don't have cannot be drawn from the sprites.
 - Some AI models add detail of their own (e.g. stained glass); the model can be changed.
 
 ## Repository layout
@@ -93,10 +99,12 @@ vkproxy/          the drop-in vulkan-1.dll (C++): UI at screen resolution, xBR,
 tools/            standard-library Python:
   font_atlas.py     HD font atlases from the game's .ffn fonts
   spr2.py           decode SPR2 sprites exactly as the game uploads them
-  hd_composite.py   prepare images for the upscaler, composite its output back
+  hd_composite.py   prepare images for the upscaler; the reference composite step
   hd_art.py         the whole HD-sprite pipeline for one part, plus install
   far.py, iff.py, ffn.py, inventory.py, exe_strings.py   file-format readers
-ai_upscale/       the AI step (PyTorch + spandrel), model list with licences
+ai_upscale/       the AI step (PyTorch + spandrel) and the composite step on the GPU,
+                  model list with licences
+catalog/          HD catalogue pictures assembled from the HD sprites (numpy), review pages
 launcher/         old interim fix (switch desktop to 1080p); superseded
 docs/             PLAN.md and FINDINGS.md (Thai)
 tests/            unit tests on synthetic files (no game data)

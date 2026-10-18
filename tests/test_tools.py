@@ -16,6 +16,7 @@ import far  # noqa: E402
 import ffn  # noqa: E402
 import font_atlas  # noqa: E402
 import iff  # noqa: E402
+import hd_art  # noqa: E402
 import hd_composite  # noqa: E402
 import inventory  # noqa: E402
 import spr2  # noqa: E402
@@ -255,6 +256,38 @@ class HdCompositeTests(unittest.TestCase):
         self.assertEqual(colours, [(255, 0, 0), (0, 255, 0), (255, 0, 0), (0, 255, 0), (0, 255, 0)])
         self.assertEqual([out[i * 4 + 3] for i in range(5)], [255, 255, 0, 0, 0])  # alpha untouched
 
+    def test_tile_fill_puts_the_neighbouring_tiles_around_a_floor_diamond(self):
+        # a 15x8 floor diamond (w = 2h - 1), every pixel its own colour; the game lays the
+        # next tiles (8, 4) and (-8, 4) away, so the corners are those tiles' pixels
+        w, h = 15, 8
+
+        def inside(x, y):
+            return abs(x - 7) <= 2 * y if y < 4 else 2 * (y - 4) <= x <= 14 - 2 * (y - 4)
+
+        rgba = bytearray(w * h * 4)
+        for y in range(h):
+            for x in range(w):
+                if inside(x, y):
+                    rgba[(y * w + x) * 4:(y * w + x + 1) * 4] = bytes((x * 16, y * 30, 7, 255))
+        out = hd_composite.tile_fill(w, h, rgba)
+
+        def colour(buf, x, y):
+            return tuple(buf[(y * w + x) * 4:(y * w + x) * 4 + 3])
+
+        self.assertEqual(colour(out, 14, 7), colour(rgba, 6, 3))  # lower right: the tile (8, 4) away
+        self.assertEqual(colour(out, 0, 0), colour(rgba, 8, 4))   # upper left: the tile (-8, -4) away
+        self.assertEqual(colour(out, 7, 5), colour(rgba, 7, 5))   # inside: untouched
+        self.assertEqual(out[3::4], rgba[3::4])                   # alpha untouched
+        # every corner pixel got a neighbour's colour, none a mirror image
+        for y in range(h):
+            for x in range(w):
+                if not inside(x, y):
+                    self.assertTrue(any(inside(x - dx, y - dy) and colour(out, x, y) == colour(rgba, x - dx, y - dy)
+                                        for dx, dy in ((8, 4), (-8, 4), (8, -4), (-8, -4))), (x, y))
+        # not a floor diamond: mirror fill, as for objects
+        row = bytearray(b for px in [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 0, 0)] for b in px)
+        self.assertEqual(hd_composite.tile_fill(3, 1, row), hd_composite.mirror_fill(3, 1, row))
+
     def test_composite_keeps_coverage_and_takes_colour_inside(self):
         # 3x1 original (premultiplied BGRA): opaque, opaque, transparent
         orig = bytes([10, 20, 30, 255, 10, 20, 30, 255, 0, 0, 0, 0])
@@ -305,6 +338,43 @@ class HdCompositeTests(unittest.TestCase):
         self.assertEqual(out[0:4], bytearray([255, 0, 0, 255]))
         self.assertTrue(all(abs(a - b) <= 1 for a, b in zip(out[4:8], [128, 0, 128, 255])), out[4:8])  # 50/50
         self.assertEqual(out[8:12], bytearray([0, 0, 255, 255]))
+
+
+class HdArtTests(unittest.TestCase):
+    def test_a_touched_up_texture(self):
+        # built 4x1 texture: opaque grey, half-covered grey (a shadow), opaque grey, empty;
+        # the edit paints all red and opaque, except that it erases the third pixel
+        built = bytes([100, 100, 100, 255, 50, 50, 50, 128, 100, 100, 100, 255, 0, 0, 0, 0])
+        with tempfile.TemporaryDirectory() as d:
+            png = Path(d) / "e.png"
+            hd_composite.write_png(png, 4, 1, bytes([200, 0, 0, 255, 200, 0, 0, 255, 200, 0, 0, 0, 200, 0, 0, 255]))
+            # the shadow keeps its alpha, the erased pixel goes, the empty one is painted: grown
+            self.assertEqual(hd_art.apply_edit(built, 4, 1, png),
+                             (bytes([0, 0, 200, 255, 0, 0, 100, 128, 0, 0, 0, 0, 0, 0, 200, 255]), True))
+            built = built[:8]
+            # drawn twice as large: averaged down; nothing painted outside: not grown
+            hd_composite.write_png(png, 4, 2, bytes([200, 0, 0, 255, 0, 0, 0, 255] * 4))
+            self.assertEqual(hd_art.apply_edit(built, 2, 1, png), (bytes([0, 0, 100, 255, 0, 0, 50, 128]), False))
+            hd_composite.write_png(png, 3, 1, bytes(12))
+            with self.assertRaises(ValueError):
+                hd_art.apply_edit(built, 2, 1, png)
+            # exported for editing: straight colour, opaque where anything is drawn
+            hd_art.export_edit(bytes([10, 20, 30, 255, 0, 0, 0, 0]), 2, 1, png)
+            self.assertEqual(hd_composite.read_png(png)[2], bytearray([30, 20, 10, 255, 0, 0, 0, 0]))
+
+    def test_depth_texture_and_its_twin(self):
+        # 3x1 frame: a pixel at depth 10, one with no depth (255: the game discards it), none
+        f = spr2.Frame(3, 1, 7, 0, 0, [(1, None), (1, None), None], [10, 255, 255])
+        self.assertEqual(hd_art.depth_texture(f), bytes([10, 255, 0]))  # 0 where no pixel: nearest
+        twin = hd_art.depth_twin(3, 1, bytes([1, 1, 0]), hd_art.depth_texture(f))
+        self.assertEqual(len(twin), 9 * 3)
+        for y in range(3):
+            # 3x the original where it covers, one unit nearer (255 stays 255); past it, the
+            # nearest depth (the depth-10 pixel: the 255 one has none to give), as near
+            self.assertEqual(twin[y * 9:(y + 1) * 9], bytes([9] * 3 + [255] * 3 + [9] * 3))
+        # grown below the original: nearer the lower it is, as the ground it stands on
+        twin = hd_art.depth_twin(1, 2, bytes([1, 0]), bytes([20, 0]))
+        self.assertEqual([twin[y * 3] for y in range(6)], [19, 19, 19, 18, 18, 17])
 
 
 class FarTests(unittest.TestCase):

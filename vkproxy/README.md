@@ -24,10 +24,21 @@ instead of the system loader. It forwards every call to the real loader
   file keep xBR. Twins are kept by content after the game's image goes, so turning the
   camera back to a view reuses them (idle twins: up to a quarter of the GPU memory, at
   most 2 GB, longest idle dropped first).
+- depth twins: each object sprite comes with a 1x depth texture (R8: the sprite's z, 0
+  where it has no pixel, i.e. nearest). For a sprite whose HD coverage grows past the
+  original (an outline rounded off by hand, `hd_art.py --install-edits`), a 3x depth
+  texture `<w>x<h>_<hash>_f9@<scale>.raw` is bound in its place (set 1 of the world's
+  object pipeline), so the new edge pixels have a depth instead of drawing through walls.
 
 The log has a `perf:` line for each frame that uploads textures or takes over 40 ms:
 time spent hashing uploads, reading replacement files and allocating, and how many twins
 are shown, kept and idle.
+
+**F7** (or a `bench.now` file) benchmarks the next 600 frames (about 10 s): frame time
+average, p50/p95/p99 and worst, and the proxy's share per frame (draw hooks, uploads,
+submit), with the HD/xBR settings. The summary goes to the log and is appended to
+`bench.log` in the output folder, so versions and settings can be compared on the same
+scene (e.g. once with F9 HD on, once off).
 
 ## Build
 
@@ -44,10 +55,10 @@ powershell -File vkproxy\build.ps1   # -> vkproxy\build\vulkan-1.dll
 2. Copy `vkproxy\build\vulkan-1.dll` next to `Sims.exe`, and the HD font atlases (if
    generated) to `vkproxy\replace\` in the same folder. Remove both to uninstall.
 
-Keys (only while the game window has focus): **F9** toggles the HD (content-replaced)
-textures, **F10** toggles xBR, **F11** logs every render pass and draw of the next frame.
-Creating an empty file `hd.toggle`, `xbr.toggle` or `trace.now` in the output folder does
-the same without touching the keyboard. Log and dumped shaders go to
+Keys (only while the game window has focus): **F7** benchmarks (below), **F9** toggles the
+HD (content-replaced) textures, **F10** toggles xBR, **F11** logs every render pass and
+draw of the next frame. Creating an empty file `bench.now`, `hd.toggle`, `xbr.toggle` or
+`trace.now` in the output folder does the same without touching the keyboard. Log and dumped shaders go to
 `%VKPROXY_DIR%` (default `%TEMP%\vkproxy`).
 
 Environment variables, for testing (set before starting `Sims.exe` directly; needs

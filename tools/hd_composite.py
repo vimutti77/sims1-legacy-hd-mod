@@ -8,6 +8,7 @@ Two steps around the AI upscaler (ai_upscale/):
              alpha, and every not-solid pixel filled with the picture mirrored across
              the nearest solid edge. The upscaler then sees surfaces continue past
              cuts and outlines instead of a hard edge, and draws no halo there.
+             (Floor tiles are filled with their neighbours instead: tile_fill.)
 
   composite  <orig_dir> <ai_dir> <out_dir>
              For each <ai_dir>/<name>.png (the upscaler's output, any integer scale
@@ -151,9 +152,37 @@ def mirror_fill(w: int, h: int, rgba: bytearray) -> bytearray:
     return out
 
 
+def tile_fill(w: int, h: int, rgba: bytearray) -> bytearray:
+    """Floor tiles: colour every empty pixel from the neighbouring tiles. A floor sprite
+    is a diamond w = 2h - 1 wide that the game lays edge to edge, the next tile
+    ((w + 1) / 2, h / 2) away, so the corners around the diamond are where the
+    neighbours (the same floor) are drawn. The upscaler then sees the pattern run on
+    across the tile edges; with a mirror image there it drew a seam along every edge
+    (grout lines broke into dashes). A sprite of another shape is mirror-filled."""
+    if w + 1 != 2 * h:
+        return mirror_fill(w, h, rgba)
+    a, b = (w + 1) // 2, h // 2
+    work = bytearray(rgba)
+    for dx, dy in ((a, b), (-a, b), (a, -b), (-a, -b)):
+        for y in range(max(dy, 0), min(h, h + dy)):
+            for x in range(max(dx, 0), min(w, w + dx)):
+                i = (y * w + x) * 4
+                s = ((y - dy) * w + (x - dx)) * 4
+                if work[i + 3] < SOLID and rgba[s + 3] >= SOLID:
+                    work[i:i + 4] = rgba[s:s + 4]
+    out = mirror_fill(w, h, work)  # whatever no neighbour covers
+    out[3::4] = rgba[3::4]  # alpha untouched, as mirror_fill leaves it
+    return out
+
+
 def prep_one(orig: Path, png: Path) -> None:
     w, h = size_of(orig.stem)
     write_png(png, w, h, mirror_fill(w, h, to_straight(orig.read_bytes())))
+
+
+def prep_floor_one(orig: Path, png: Path) -> None:
+    w, h = size_of(orig.stem)
+    write_png(png, w, h, tile_fill(w, h, to_straight(orig.read_bytes())))
 
 
 # ---- composite ---------------------------------------------------------------------

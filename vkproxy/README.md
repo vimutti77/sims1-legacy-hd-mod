@@ -55,6 +55,7 @@ Environment variables, for testing (set before starting `Sims.exe` directly; nee
 | `VKPROXY_REPLACE=0` | don't replace textures (HD font atlases) |
 | `VKPROXY_DIR=<folder>` | log, shader dumps and `replace\` go here |
 | `VKPROXY_DUMP=1` | save every texture upload to `dump\` |
+| `VKPROXY_WORLDLOG=1` | name every texture upload by content hash; then **F8** (or a `world.now` file) writes the next frame's draws with their textures, push constants and vertices to `world.log` (how the catalogue builder's assembly rules were found) |
 
 ## Limits
 

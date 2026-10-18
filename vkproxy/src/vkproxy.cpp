@@ -73,6 +73,11 @@ uint32_t g_swap_w = 0, g_swap_h = 0;
 bool g_dump = false;  // VKPROXY_DUMP=1: save texture uploads (see dump_upload)
 bool g_replace_on = true;  // VKPROXY_REPLACE=0 disables texture replacement
 bool g_xbr_all = true;     // VKPROXY_XBR_ALL=0: xBR only on layer composites (see xbr_twin_for)
+// World draw log (VKPROXY_WORLDLOG=1): every texture upload is named by its content
+// hash, and F8 / world.now writes the next frame's draws with their textures, push
+// constants and vertices to <VKPROXY_DIR>\world.log (how the game assembles sprites).
+bool g_names_on = false;
+bool g_world_now = false;
 // Texture replacement (step 2): a sampled B8G8R8A8 image of w x h is created
 // g_layer_scale times larger when <g_replace_dir>\<w>x<h>@<scale>.bgra exists,
 // and every upload into it is replaced by that file's pixels.
@@ -148,9 +153,10 @@ void init() {
         if (GetEnvironmentVariableA("VKPROXY_DUMP", buf, MAX_PATH) && buf[0] == '1') g_dump = true;
         if (GetEnvironmentVariableA("VKPROXY_REPLACE", buf, MAX_PATH) && buf[0] == '0') g_replace_on = false;
         if (GetEnvironmentVariableA("VKPROXY_XBR_ALL", buf, MAX_PATH) && buf[0] == '0') g_xbr_all = false;
-        logf("settings: xbr=%d xbr_all=%d layer_scale=%s replace=%d (%s) dump=%d -dpi=%d", g_xbr_on, g_xbr_all,
-             g_layer_scale_auto ? "auto" : std::to_string(g_layer_scale).c_str(), g_replace_on,
-             g_replace_dir.c_str(), g_dump, g_dpi_arg);
+        if (GetEnvironmentVariableA("VKPROXY_WORLDLOG", buf, MAX_PATH) && buf[0] == '1') g_names_on = true;
+        logf("settings: xbr=%d xbr_all=%d layer_scale=%s replace=%d (%s) dump=%d worldlog=%d -dpi=%d", g_xbr_on,
+             g_xbr_all, g_layer_scale_auto ? "auto" : std::to_string(g_layer_scale).c_str(), g_replace_on,
+             g_replace_dir.c_str(), g_dump, g_names_on, g_dpi_arg);
         GetSystemDirectoryA(buf, MAX_PATH);  // SysWOW64 for a 32-bit process
         strcat(buf, "\\vulkan-1.dll");
         g_real = LoadLibraryA(buf);
@@ -190,6 +196,13 @@ struct CmdState {
     std::vector<VkViewport> viewports;  // as last set by the game (unscaled)
     std::vector<VkRect2D> scissors;
     uint64_t layout0 = 0;               // pipeline layout the game last bound set 0 with
+    // for the world draw log
+    std::vector<std::pair<uint64_t, VkDeviceSize>> vbs;  // vertex buffer per binding
+    uint64_t ib = 0;
+    VkDeviceSize ib_off = 0;
+    VkIndexType ib_type = VK_INDEX_TYPE_UINT16;
+    unsigned char pc[128] = {};  // push constant bytes as last pushed
+    uint32_t pc_size = 0;
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -245,6 +258,29 @@ std::unordered_map<uint64_t, BufMem> g_buf_mem;  // VkBuffer -> memory binding
 std::unordered_map<uint64_t, MemMap> g_mem_map;  // VkDeviceMemory -> host mapping
 std::set<std::string> g_dumped;
 std::set<std::string> g_fetched;
+// World draw log state (see g_names_on).
+std::unordered_map<uint64_t, std::string> g_image_name;  // VkImage -> content name of its last upload
+struct PipeInfo {
+    std::string vs, fs;
+    std::vector<VkVertexInputBindingDescription> bindings;
+    std::vector<VkVertexInputAttributeDescription> attrs;
+};
+std::unordered_map<uint64_t, PipeInfo> g_pipe_info;  // VkPipeline
+struct DrawRec {
+    uint64_t pipeline;
+    std::vector<std::tuple<size_t, uint32_t, uint64_t>> tex;  // (set, binding, VkImage)
+    std::vector<std::pair<uint64_t, VkDeviceSize>> vbs;
+    bool indexed;
+    uint64_t ib;
+    VkDeviceSize ib_off;
+    VkIndexType ib_type;
+    uint32_t first, count;
+    int32_t vertex_offset;
+    std::vector<unsigned char> pc;
+    uint32_t rp_w, rp_h;
+};
+std::unordered_map<VkCommandBuffer, std::vector<DrawRec>> g_draw_recs;  // recorded this frame, written at submit
+unsigned g_world_seq = 0;
 unsigned g_next_image = 1, g_next_pipeline = 1;
 
 std::string image_desc(uint64_t view) {
@@ -289,6 +325,8 @@ const char* filter_name(VkFilter f) { return f == VK_FILTER_NEAREST ? "nearest" 
     X(vkCmdBindDescriptorSets)                                                                 \
     X(vkCmdDraw)                                                                               \
     X(vkCmdDrawIndexed)                                                                        \
+    X(vkCmdBindVertexBuffers)                                                                  \
+    X(vkCmdBindIndexBuffer)                                                                    \
     X(vkCmdSetViewport)                                                                        \
     X(vkCmdSetScissor)                                                                         \
     X(vkCmdPushConstants)                                                                      \
@@ -386,6 +424,7 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyImage(VkDevice d, VkImage image, const Vk
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         g_images.erase((uint64_t)image);
+        g_image_name.erase((uint64_t)image);
         if (g_replace.erase((uint64_t)image)) g_freed_replaced.insert((uint64_t)image);
         auto hd = g_hd.find((uint64_t)image);
         if (hd != g_hd.end()) {  // used by the same submissions as the game's image, so done with too
@@ -545,6 +584,19 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
                 blend = ci[i].pColorBlendState->pAttachments[0].blendEnable ? "blend" : "opaque";
             logf("createGraphicsPipeline pipe#%u%s layout=%llx renderPass=%llx %s", id, stages.c_str(),
                  (unsigned long long)ci[i].layout, (unsigned long long)ci[i].renderPass, blend);
+            PipeInfo pi;
+            for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
+                auto m = g_modules.find((uint64_t)ci[i].pStages[s].module);
+                (ci[i].pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? pi.fs : pi.vs) =
+                    m != g_modules.end() ? m->second : "?";
+            }
+            if (const VkPipelineVertexInputStateCreateInfo* vi = ci[i].pVertexInputState) {
+                pi.bindings.assign(vi->pVertexBindingDescriptions,
+                                   vi->pVertexBindingDescriptions + vi->vertexBindingDescriptionCount);
+                pi.attrs.assign(vi->pVertexAttributeDescriptions,
+                                vi->pVertexAttributeDescriptions + vi->vertexAttributeDescriptionCount);
+            }
+            g_pipe_info[(uint64_t)out[i]] = std::move(pi);
             if (quad_fs) {
                 VkPipeline twin = make_xbr_twin(d, c, ci[i]);
                 if (twin) g_xbr_twin[(uint64_t)out[i]] = twin;
@@ -850,13 +902,66 @@ void substituted_draw(VkCommandBuffer cb, const char* kind, uint32_t count, F dr
     if (twin) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
 }
 
+// World draw log: remember this draw's state; its vertices are read at submit.
+void record_draw(VkCommandBuffer cb, bool indexed, uint32_t first, uint32_t count, int32_t vertex_offset) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    if (!g_world_now) return;
+    CmdState& st = g_cmd[cb];
+    DrawRec r{};
+    r.pipeline = st.pipeline;
+    for (size_t s = 0; s < st.sets.size(); ++s) {
+        auto it = g_sets.find(st.sets[s]);
+        if (it == g_sets.end()) continue;
+        for (auto& b : it->second) {
+            auto v = g_view_image.find(b.view);
+            r.tex.emplace_back(s, b.binding, v != g_view_image.end() ? v->second : 0);
+        }
+    }
+    r.vbs = st.vbs;
+    r.indexed = indexed;
+    r.ib = st.ib;
+    r.ib_off = st.ib_off;
+    r.ib_type = st.ib_type;
+    r.first = first;
+    r.count = count;
+    r.vertex_offset = vertex_offset;
+    r.pc.assign(st.pc, st.pc + st.pc_size);
+    r.rp_w = st.rp_w;
+    r.rp_h = st.rp_h;
+    g_draw_recs[cb].push_back(std::move(r));
+}
+
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+    record_draw(cb, false, fv, vc, 0);
     substituted_draw(cb, "draw", vc, [&] { real_vkCmdDraw(cb, vc, ic, fv, fi); });
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_t ic, uint32_t fi,
                                                 int32_t vo, uint32_t fin) {
+    record_draw(cb, true, fi, n, vo);
     substituted_draw(cb, "drawIndexed", n, [&] { real_vkCmdDrawIndexed(cb, n, ic, fi, vo, fin); });
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n,
+                                                     const VkBuffer* bufs, const VkDeviceSize* offs) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        auto& v = g_cmd[cb].vbs;
+        if (v.size() < first + n) v.resize(first + n);
+        for (uint32_t i = 0; i < n; ++i) v[first + i] = {(uint64_t)bufs[i], offs[i]};
+    }
+    real_vkCmdBindVertexBuffers(cb, first, n, bufs, offs);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkIndexType t) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        CmdState& st = g_cmd[cb];
+        st.ib = (uint64_t)b;
+        st.ib_off = off;
+        st.ib_type = t;
+    }
+    real_vkCmdBindIndexBuffer(cb, b, off, t);
 }
 
 // Transfers touching an enlarged image are not rescaled yet; make them visible.
@@ -919,6 +1024,12 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineL
             s += b;
         }
         logf("    pushConstants stages=%x off=%u size=%u:%s", static_cast<unsigned>(stages), offset, size, s.c_str());
+    }
+    if (offset + size <= sizeof(CmdState::pc)) {  // kept for the world draw log
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        CmdState& st = g_cmd[cb];
+        memcpy(st.pc + offset, values, size);
+        st.pc_size = std::max(st.pc_size, offset + size);
     }
     real_vkCmdPushConstants(cb, layout, stages, offset, size, values);
 }
@@ -1313,6 +1424,13 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffe
     }
     real_vkCmdCopyBufferToImage(cb, src, dst, dl, n, r);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
+    if (g_names_on) {
+        const ImageInfo* info = nullptr;
+        if (const unsigned char* p = upload_pixels(src, dst, n, r, &info))
+            g_image_name[(uint64_t)dst] = content_name(*info, p);
+        else
+            g_image_name.erase((uint64_t)dst);
+    }
     hd_upload(cb, src, dst, n, r);
 }
 
@@ -1500,7 +1618,95 @@ bool consume_trigger(const char* name) {
     return true;
 }
 
+// Host pointer to len bytes at off within buffer, or null when that memory is not mapped.
+const char* mapped_at(uint64_t buffer, VkDeviceSize off, VkDeviceSize len) {
+    auto bm = g_buf_mem.find(buffer);
+    if (bm == g_buf_mem.end()) return nullptr;
+    auto mm = g_mem_map.find(bm->second.memory);
+    if (mm == g_mem_map.end()) return nullptr;
+    VkDeviceSize start = bm->second.offset + off;
+    if (start < mm->second.offset || (mm->second.size != VK_WHOLE_SIZE && start + len > mm->second.offset + mm->second.size))
+        return nullptr;
+    return mm->second.ptr + (start - mm->second.offset);
+}
+
+std::string attr_text(const char* p, VkFormat fmt) {
+    char b[160];
+    auto f = reinterpret_cast<const float*>(p);
+    auto u = reinterpret_cast<const unsigned char*>(p);
+    switch (fmt) {
+    case VK_FORMAT_R32_SFLOAT: snprintf(b, sizeof b, "%g", f[0]); break;
+    case VK_FORMAT_R32G32_SFLOAT: snprintf(b, sizeof b, "%g,%g", f[0], f[1]); break;
+    case VK_FORMAT_R32G32B32_SFLOAT: snprintf(b, sizeof b, "%g,%g,%g", f[0], f[1], f[2]); break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: snprintf(b, sizeof b, "%g,%g,%g,%g", f[0], f[1], f[2], f[3]); break;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM: snprintf(b, sizeof b, "#%02x%02x%02x%02x", u[0], u[1], u[2], u[3]); break;
+    default: snprintf(b, sizeof b, "fmt%d", static_cast<int>(fmt));
+    }
+    return b;
+}
+
+// Write the world-log draws recorded into cb (called just before it is submitted,
+// when the game has finished writing its vertex data).
+void write_world_draws(VkCommandBuffer cb) {
+    auto it = g_draw_recs.find(cb);
+    if (it == g_draw_recs.end()) return;
+    static FILE* out = nullptr;
+    if (!out) out = fopen((g_dir + "\\world.log").c_str(), "w");
+    if (!out) return;
+    for (auto& r : it->second) {
+        auto pid = g_pipelines.find(r.pipeline);
+        auto pi = g_pipe_info.find(r.pipeline);
+        fprintf(out, "D %u frame %u pipe#%u vs=%s fs=%s %s first=%u count=%u voff=%d pass=%ux%u\n", g_world_seq++,
+                g_frame, pid != g_pipelines.end() ? pid->second : 0, pi != g_pipe_info.end() ? pi->second.vs.c_str() : "?",
+                pi != g_pipe_info.end() ? pi->second.fs.c_str() : "?", r.indexed ? "indexed" : "plain", r.first, r.count,
+                r.vertex_offset, r.rp_w, r.rp_h);
+        for (auto& [set, binding, image] : r.tex) {
+            auto n = g_image_name.find(image);
+            auto im = g_images.find(image);
+            fprintf(out, "  T s%u b%u %s %ux%u\n", static_cast<unsigned>(set), binding,
+                    n != g_image_name.end() ? n->second.c_str() : img_desc(image).c_str(),
+                    im != g_images.end() ? im->second.w : 0, im != g_images.end() ? im->second.h : 0);
+        }
+        if (!r.pc.empty()) {
+            fprintf(out, "  P");
+            for (size_t i = 0; i + 4 <= r.pc.size(); i += 4) fprintf(out, " %g", *reinterpret_cast<const float*>(&r.pc[i]));
+            fprintf(out, "\n");
+        }
+        if (pi == g_pipe_info.end()) continue;
+        uint32_t n = std::min(r.count, 64u);
+        for (uint32_t k = 0; k < n; ++k) {
+            int64_t vertex = r.first + k;
+            if (r.indexed) {
+                size_t isz = r.ib_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+                const char* ip = mapped_at(r.ib, r.ib_off + (r.first + k) * isz, isz);
+                if (!ip) break;
+                vertex = (isz == 4 ? *reinterpret_cast<const uint32_t*>(ip) : *reinterpret_cast<const uint16_t*>(ip)) +
+                         static_cast<int64_t>(r.vertex_offset);
+            }
+            std::string line;
+            for (auto& a : pi->second.attrs) {
+                uint32_t stride = 0;
+                for (auto& b : pi->second.bindings)
+                    if (b.binding == a.binding) stride = b.stride;
+                if (a.binding >= r.vbs.size()) continue;
+                const char* p = mapped_at(r.vbs[a.binding].first, r.vbs[a.binding].second + vertex * stride + a.offset, 16);
+                line += " " + std::to_string(a.location) + "=" + (p ? attr_text(p, a.format) : std::string("?"));
+            }
+            fprintf(out, "  V %lld%s\n", static_cast<long long>(vertex), line.c_str());
+        }
+    }
+    fflush(out);
+    g_draw_recs.erase(it);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        if (!g_draw_recs.empty())
+            for (uint32_t i = 0; i < n; ++i)
+                for (uint32_t k = 0; k < s[i].commandBufferCount; ++k) write_world_draws(s[i].pCommandBuffers[k]);
+    }
     VkResult r = real_vkQueueSubmit(q, n, s, f);
     if (r != VK_SUCCESS) {
         static unsigned logged = 0;
@@ -1531,10 +1737,25 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
     bool toggle = (GetAsyncKeyState(VK_F10) & 1) && focused;
     bool trace = (GetAsyncKeyState(VK_F11) & 1) && focused;
     bool hd_toggle = (GetAsyncKeyState(VK_F9) & 1) && focused;
+    bool world = (GetAsyncKeyState(VK_F8) & 1) && focused;
     if (g_frame % 30 == 0) {
         toggle = consume_trigger("xbr.toggle") || toggle;
         trace = consume_trigger("trace.now") || trace;
         hd_toggle = consume_trigger("hd.toggle") || hd_toggle;
+        world = consume_trigger("world.now") || world;
+    }
+    if (g_world_now) {
+        g_world_now = false;
+        g_draw_recs.clear();  // anything recorded but never submitted
+        logf("== world log of frame %u written (%u draws so far)", g_frame, g_world_seq);
+    }
+    if (world) {
+        if (g_names_on) {
+            g_world_now = true;
+            logf("== world log: recording frame %u", g_frame + 1);
+        } else {
+            logf("== world log needs VKPROXY_WORLDLOG=1 from game start (texture names)");
+        }
     }
     if (toggle) {
         g_xbr_on = !g_xbr_on;

@@ -2,6 +2,7 @@
 
 Needs numpy; skipped without it.
 """
+import json
 import struct
 import sys
 import tempfile
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "catalog"))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import hd_composite  # noqa: E402
 import objects  # noqa: E402
 import spr2  # noqa: E402
 from test_tools import make_iff  # noqa: E402
@@ -23,6 +25,7 @@ try:
     import assemble
     import build
     import fit
+    import review
 except ImportError:  # numpy missing
     np = None
 
@@ -299,23 +302,108 @@ class BuildTests(unittest.TestCase):
         self.assertEqual((row["source"], px), ("none (by hand)", None))
         row, _ = self.build({"graphic": 0, "mirror": True})  # mirrored only when asked
         self.assertEqual((row["graphic"], row["mirror"]), (0, True))
+        row, _ = self.build({"box": True})  # placed by the bounding boxes alone
+        self.assertEqual(row["graphic"], 1)
+        self.assertAlmostEqual(row["scale"], 2.0, delta=0.15)
         row, _ = self.build({"center": True})
         canvas_w = 8 * row["scale"]  # the one sprite, 8 px wide
         self.assertAlmostEqual(row["x"] + canvas_w / 2, 37 / 2, delta=0.01)
 
+    def test_a_picture_drawn_from_another_object(self):
+        # a test object without sprites whose picture shows the other object, state 1
+        target = objects.ObjectFile(make_iff([("OBJD", 1, "Tester", objd(0, catpic=2000)),
+                                              ("BMP_", 2000, "pic", self.obj.bmp[2000])]), "tester.iff")
+        (o, _tiles), = objects.catalogue_objects(target)
+        row, px = build.build_borrowed(target, o, self.obj, self.hd_dir, {"from": "Thing", "graphic": None})
+        self.assertEqual((row["label"], row["iff"], row["graphic"]), ("Tester", "tester.iff", 1))
+        self.assertLess(build.error_of(row), 3)
+        self.assertEqual(len(px), 222 * 111 * 4)
+
+    def test_keeping_own_sprites_when_drawing_another_object(self):
+        # same object, own sprites in other colours: kept, they (and their palette) are used
+        other = [(0, 0, 0), (0, 248, 0), (248, 0, 248), (0, 252, 248), (248, 252, 248)]
+        data = make_iff([("OBJD", 1, "Tester", objd(0, catpic=2000)), ("BMP_", 2000, "pic", self.obj.bmp[2000]),
+                         ("PALT", 1, "pal", palt(other)),
+                         ("SPR2", 10, "spr", spr2_chunk([frame(8, 6, 30, 40, two_colour(8, 6, 1, 2)),
+                                                         frame(8, 6, 30, 40, two_colour(8, 6, 3, 4))]))])
+        target = objects.ObjectFile(data, "tester.iff")
+        (o, _tiles), = objects.catalogue_objects(target)
+        plain, px_plain = build.build_borrowed(target, o, self.obj, self.hd_dir, {"from": "Thing", "graphic": 1})
+        kept, px_kept = build.build_borrowed(target, o, self.obj, self.hd_dir, {"from": "Thing", "graphic": 1, "own": [10]})
+        self.assertLess(build.error_of(plain), 3)
+        self.assertGreater(build.error_of(kept), 30)  # drawn in the target's own colours
+        self.assertNotEqual(px_plain, px_kept)
+
+    def test_install_takes_ai_pictures_unless_drawn_or_rejected(self):
+        work, game = self.hd_dir / "work", self.hd_dir / "game"
+        (work / "hd").mkdir(parents=True)
+        (work / "ai").mkdir()
+        for pic in ("p1", "p2", "p3"):
+            (work / "ai" / f"{pic}@3.bgra").write_bytes(b"ai")
+        (work / "hd" / "p1@3.bgra").write_bytes(b"drawn")
+        (work / "ai.txt").write_text("# painted icons\np1\np2\np3\n")
+        (work / "rejected.txt").write_text("p3\n")
+        rows = [dict(iff="x.iff", label="drawn", picture="p1", rmse_normal=1.0, rmse_selected=1.0, iou=1.0)]
+        build.install(work, game, rows)
+        dest = game / "vkproxy" / "replace"
+        self.assertEqual((dest / "p1@3.bgra").read_bytes(), b"drawn")  # drawn from sprites wins
+        self.assertEqual((dest / "p2@3.bgra").read_bytes(), b"ai")
+        self.assertFalse((dest / "p3@3.bgra").exists())
+        self.assertEqual(build.read_list(work / "installed.txt"), {"p1", "p2"})
+
+    def test_ai_picture_halves(self):
+        import ai_pictures
+        rgba = bytes(range(256)) * (74 * 37 * 4 // 256) + bytes(74 * 37 * 4 % 256)
+        a, b = ai_pictures.half(rgba, 0), ai_pictures.half(rgba, 1)
+        self.assertEqual(len(a), 37 * 37 * 4)
+        self.assertEqual(a[:8], rgba[:8])
+        self.assertEqual(b[:4], rgba[37 * 4:38 * 4])
+        n = 37 * 3 * 4
+        twin = b"".join(bytes([7]) * 37 * 4 + bytes([9]) * 37 * 4 for _ in range(37))
+        self.assertTrue(ai_pictures.same_halves(twin))  # within the tolerance
+        self.assertFalse(ai_pictures.same_halves(twin, tolerance=1))
+        joined = ai_pictures.join([bytes([1]) * n * 111, bytes([2]) * n * 111])
+        self.assertEqual(joined[:n], bytes([1]) * n)
+        self.assertEqual(joined[n:2 * n], bytes([2]) * n)
+
+    def test_a_drawing_is_placed_where_the_picture_has_its_object(self):
+        import ai_pictures
+        bg, red = (111, 168, 190), (200, 30, 30)
+        # the game's picture: a 10x10 red square at (5, 8) in both halves
+        pic = bytearray(bytes(bg + (255,)) * 74 * 37)
+        for y in range(8, 18):
+            for x in list(range(5, 15)) + list(range(42, 52)):
+                pic[(y * 74 + x) * 4:(y * 74 + x) * 4 + 4] = bytes(red + (255,))
+        # the drawing: the same square, 100x100 on a slightly different blue
+        art = bytearray(bytes((105, 160, 185, 255)) * 200 * 200)
+        for y in range(50, 150):
+            for x in range(50, 150):
+                art[(y * 200 + x) * 4:(y * 200 + x) * 4 + 4] = bytes(red + (255,))
+        out, err = ai_pictures.fit_art(bytes(art), 200, 200, bytes(pic))
+        hd = np.frombuffer(out, np.uint8).reshape(111, 222, 4)
+        self.assertLess(err, 3)
+        self.assertEqual(tuple(hd[3 * 12, 3 * 9, :3]), red[::-1])  # BGR, inside the square
+        self.assertEqual(tuple(hd[3 * 30, 3 * 30, :3]), bg[::-1])  # the picture's own background
+        self.assertEqual(tuple(hd[3 * 12, 111 + 3 * 9, :3]), red[::-1])  # the other half too
+
     def test_load_overrides(self):
         p = self.hd_dir / "overrides.tsv"
-        p.write_text("# comment\nA\t21\nB\t0\toff\t2\ttrue\tcenter\nC\tnone\nD\t\ton:\nE\t1\ton:200,202\n", encoding="utf-8")
+        p.write_text("# comment\nA\t21\nB\t0\toff\t2\ttrue\tcenter\nC\tnone\nD\t\ton:\nE\t1\ton:200,202\nF\t\t\t2\t\tbox\nG\t0\t\t\t\t\tSand Castle\na.iff:H\t0\t\t\t\t\tb.iff:H\t100,101\n", encoding="utf-8")
         ov = build.load_overrides(p)
-        self.assertEqual(ov["A"], dict(graphic=21, dynamic=None, view=None, mirror=None, center=False))
-        self.assertEqual(ov["B"], dict(graphic=0, dynamic=False, view=2, mirror=True, center=True))
+        self.assertEqual(ov["A"], dict(graphic=21, dynamic=None, view=None, mirror=None, center=False, box=False, own=[], **{"from": None}))
+        self.assertEqual(ov["B"], dict(graphic=0, dynamic=False, view=2, mirror=True, center=True, box=False, own=[], **{"from": None}))
+        self.assertEqual((ov["F"]["view"], ov["F"]["box"], ov["F"]["from"]), (2, True, None))
+        self.assertEqual(ov["G"]["from"], "Sand Castle")
+        self.assertEqual((ov["a.iff:H"]["from"], ov["a.iff:H"]["own"]), ("b.iff:H", [100, 101]))
+        self.assertIs(build.override_for(ov, "pack.far/a.iff", "H"), ov["a.iff:H"])
+        self.assertEqual(build.override_for(ov, "pack.far/c.iff", "H"), {})
         self.assertEqual(ov["C"], {"none": True})
         self.assertEqual((ov["D"]["graphic"], ov["D"]["dynamic"]), (None, frozenset()))
         self.assertEqual(ov["E"]["dynamic"], frozenset({200, 202}))
 
     def test_choose(self):
         def row(label, pic, err, iou):
-            return dict(label=label, picture=pic, rmse_normal=err, rmse_selected=err, iou=iou)
+            return dict(iff="x.iff", label=label, picture=pic, rmse_normal=err, rmse_selected=err, iou=iou)
 
         rows = [row("good", "p1", 5, 0.9), row("bad colour", "p2", 20, 0.9), row("bad shape", "p3", 5, 0.5),
                 row("approved", "p4", 30, 0.2), row("rejected", "p5", 1, 1.0), row("by hand", "p6", 40, 0.1),
@@ -324,6 +412,47 @@ class BuildTests(unittest.TestCase):
         chosen = build.choose(rows, approved={"p4"}, rejected={"p5"},
                               overrides={"by hand": {"graphic": 1}, "none by hand": {"none": True}})
         self.assertEqual(chosen, {"p1", "p2", "p4", "p6"})
+
+
+@unittest.skipIf(np is None, "needs numpy")
+class ReviewTests(unittest.TestCase):
+    def test_confirmed_pictures_stay_out_until_they_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, page = Path(d) / "work", Path(d) / "page"
+            (work / "hd").mkdir(parents=True)
+            (page / "img").mkdir(parents=True)
+            rng = np.random.default_rng(1)
+            pics = {p: rng.integers(0, 256, (111, 222, 4), np.uint8) for p in ("p1", "p2")}
+            items = [dict(k="c9", pic="p3", name="p3", built=False, src="")]  # nothing to draw
+            for k, (pic, bgra) in enumerate(pics.items()):
+                (work / "hd" / f"{pic}@3.bgra").write_bytes(bgra.tobytes())
+                hd_composite.write_png(page / "img" / f"c{k}_hd.png", 222, 111, bgra[..., [2, 1, 0, 3]].tobytes())
+                items.append(dict(k=f"c{k}", pic=pic, name=pic, built=True, src="hd"))
+            (page / "index.html").write_text(f"<script>\nconst ITEMS = {json.dumps(items)};\n</script>",
+                                             encoding="utf-8")
+            other = pics["p2"].copy()
+            other[..., :3] = 255 - other[..., :3]
+            (work / "hd" / "p2@3.bgra").write_bytes(other.tobytes())  # rebuilt after the page was made
+            self.assertEqual(review.confirm(page, work), (2, ["p2"]))
+            seen, hd = work / "reviewed", work / "hd"
+            self.assertTrue(review.already_reviewed(seen / "p1@3.bgra", hd / "p1@3.bgra"))
+            self.assertFalse(review.already_reviewed(seen / "p2@3.bgra", hd / "p2@3.bgra"))
+            self.assertTrue(review.already_reviewed(seen / "p3@3.bgra", None))
+            self.assertFalse(review.already_reviewed(seen / "p3@3.bgra", hd / "p1@3.bgra"))  # drawn now
+            (hd / "p1@3.bgra").write_bytes(other.tobytes())  # changed visibly: shown again
+            self.assertFalse(review.already_reviewed(seen / "p1@3.bgra", hd / "p1@3.bgra"))
+
+    def test_confirming_only_the_picked_pictures(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, page = Path(d) / "work", Path(d) / "page"
+            page.mkdir()
+            items = [dict(k=f"c{k}", pic=pic, name=pic, built=False, src="")
+                     for k, pic in enumerate(("74x37_00000000000000a1", "74x37_00000000000000a2"))]
+            (page / "index.html").write_text(f"<script>\nconst ITEMS = {json.dumps(items)};\n</script>",
+                                             encoding="utf-8")
+            picked = review.picture_names("Bees\tEP7.far/Bees.iff\t74x37_00000000000000a2\tผิด\t\n")
+            self.assertEqual(review.confirm(page, work, picked), (1, []))
+            self.assertEqual([p.name for p in (work / "reviewed").iterdir()], ["74x37_00000000000000a2@3.bgra"])
 
 
 if __name__ == "__main__":

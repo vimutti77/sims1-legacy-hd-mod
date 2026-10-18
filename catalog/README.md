@@ -14,6 +14,7 @@ $game = "C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collectio
 py catalog\build.py --game $game --install            # about 1.5 minutes on 24 threads
 py catalog\review.py --game $game                      # local page: game's picture vs HD
 py catalog\review.py --game $game --pending            # only what is not installed
+py catalog\review.py --confirm work\catalog_review --picked picked.txt   # these are right: off later pages
 py catalog\build.py --game $game --labels "Child's Stepstool" --install   # one object again
 ```
 
@@ -22,7 +23,7 @@ py catalog\build.py --game $game --labels "Child's Stepstool" --install   # one 
 1. **Assemble** (`assemble.py`): the object's sprites, placed and depth-tested the way the
    game draws them in a lot. The rules were taken from the running game's draw calls
    (vkproxy's world log); they are listed in the module docstring.
-2. **Fit** (`fit.py`): every state (up to 32), view, mirror and dynamic-sprite setting is
+2. **Fit** (`fit.py`): every state (up to 64), view and dynamic-sprite setting is
    scaled and placed onto the game's picture; the best match by colour error wins.
    The game's pictures were made by Maxis from renders, not by the game, so a few are
    not reachable from the sprites at all (spell icons, magazines; slot contents such as
@@ -37,10 +38,14 @@ A picture is installed when the 1× assembly matches the game's picture (colour 
 
 | File | |
 |---|---|
-| `overrides.tsv` | per object label: state, dynamic sprites on/off, view, mirror, `center`; or `none` |
+| `overrides.tsv` | per object label: state, dynamic sprites, view, mirror, `center` / `box`, another object to draw instead; or `none` (columns in `build.py`) |
 | `approved.txt` | pictures accepted by eye although they fail the checks |
 | `rejected.txt` | pictures found wrong by eye: never installed |
 | `installed.txt` | written by `--install`, so a later install can take pictures out again |
+| `ai.txt` | painted icons no sprite looks like (magazines, a gift of preserves): `ai_pictures.py` upscales them with the AI into `ai/`, and `--install` installs them |
+| `ai_input/` | a picture from `ai.txt` cleaned up by hand before the AI sees it (`ai_pictures.py --export <picture>` writes the game's one to start from) |
+| `art/` | a picture from `ai.txt` redrawn by hand at any size: placed onto the game's picture instead of upscaling |
+| `reviewed/` | written by `review.py --confirm`: the HD pictures found right on a page, as they were then; later pages leave them out until they change visibly |
 
 `review.py` lets you tick wrong pictures and add a note to each; the copy button puts the
 ticked and noted ones on the clipboard. `states.py --pictures <file>` shows every view and

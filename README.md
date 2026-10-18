@@ -87,8 +87,10 @@ allowed and guaranteed to match.
 - Object outlines keep the original stair-step edge: the game reads each pixel's depth
   from a low-resolution z-buffer, so a sprite must not grow past its original shape.
 - Floors, walls, wallpapers, UI icons and Sims (3D models) are not HD yet.
-- 56 of the 1,406 catalogue pictures stay as they are: spells, magazines and objects
-  shown with contents the sprites don't have cannot be drawn from the sprites.
+- 8 of the 1,406 catalogue pictures stay as they are, mostly system objects with no
+  sprite to draw from. A few painted icons, such as the magazines, are upscaled by the AI
+  instead. Spell effects keep their shape but not their colours: Maxis painted those
+  pictures differently from the sprites.
 - Some AI models add detail of their own (e.g. stained glass); the model can be changed.
 
 ## Repository layout

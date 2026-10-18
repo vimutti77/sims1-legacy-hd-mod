@@ -9,7 +9,8 @@ docs/FINDINGS.md):
     34 and 17 at the other zooms); its y is the SPR2 frame header y (= DGRP y + 348 - the
     frame's height: the DGRP y is the sprite's bottom, not its top);
   - each frame uses the SPR2 chunk's palette (spr2.frame_palette);
-  - depth = z + GAME_K * (tile steps away from the camera); a pixel is drawn when its alpha
+  - depth = z + GAME_K * (tile steps away from the camera) - DGRP_Z_K * (the sprite's DGRP z,
+    its height, which also raises the sprite LIFT_PX per unit); a pixel is drawn when its alpha
     is at least 0.25, its z byte below 255 and its depth not behind what is there (ties go
     to the later draw). Sprites without a z-buffer (shadows) are drawn in order;
   - dynamic sprites (OBJD fields 62/63) are off unless the object turns them on;
@@ -34,6 +35,10 @@ NEAR_ZOOM = 3
 ZOOM_SIZE = {3: 1.0, 2: 0.5, 1: 0.25}  # screen size of a DGRP zoom level relative to the near one
 HEADER_X = 68  # DGRP x + 68 = frame header x
 GAME_K = 0.00529 / 0.0279 * 254  # z units per tile step: the game's depth offset per tile / z range
+# z units per unit of a sprite's DGRP z (its height above the tile: candy floss in a cart's
+# bowl is 1.306, so the game draws it 0.001152 nearer than the cart, 1/6 of a tile step)
+DGRP_Z_K = 0.001152 / 1.306 / 0.0279 * 254
+LIFT_PX = 16  # and that many screen pixels (near zoom) higher per unit of DGRP z (21 for the floss)
 TILE_STEP_Y = 32  # screen y (near zoom) of one tile step
 MIN_ALPHA = 0.25
 SCALE = 3  # HD sprites are 3x
@@ -109,6 +114,7 @@ class Piece:
     """One sprite as drawn: its top-left on screen (x, y), tile steps away from the camera
     (depth order), image and z-buffer as drawn (mirrored when the DGRP says so)."""
     steps: float
+    lift: float  # the DGRP z: drawn this much nearer
     x: int
     y: int
     rgba: np.ndarray
@@ -157,8 +163,9 @@ def place(sprites: Sprites, tiles: list[dict], graphic: int, view: int, zoom: in
             flip = bool(s["flags"] & 1)
             if flip:
                 rgba, z = rgba[:, ::-1], z[:, ::-1]
-            pieces.append(Piece(by / (TILE_STEP_Y * zf), m * (bx + s["ox"] + round(HEADER_X * zf)), m * (by + hy),
-                                rgba, z, s["spr"], s["frame"], flip, dyn))
+            lift_px = round(LIFT_PX * zf * s["z"])
+            pieces.append(Piece(by / (TILE_STEP_Y * zf), s["z"], m * (bx + s["ox"] + round(HEADER_X * zf)),
+                                m * (by + hy - lift_px), rgba, z, s["spr"], s["frame"], flip, dyn))
     return pieces
 
 
@@ -186,7 +193,7 @@ def draw(pieces: list[Piece], bounds=None):
         if not (p.z[p.rgba[..., 3] > 0] < 255).any():  # no z-buffer: drawn in order
             mask = a > 0
         else:
-            d = z.astype(np.float32) - GAME_K * p.steps  # lower on screen = nearer
+            d = z.astype(np.float32) - GAME_K * p.steps - DGRP_Z_K * p.lift  # lower on screen = nearer
             mask = (a >= MIN_ALPHA) & (z < 255) & (d <= zbuf[sl])
             zbuf[sl] = np.where(mask, d, zbuf[sl])
         c = canvas[sl]

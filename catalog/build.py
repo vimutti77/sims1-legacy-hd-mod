@@ -12,17 +12,27 @@ The HD sprites are the installed ones (tools/hd_art.py), so build those first.
 Files in --work (default work/catalog):
   hd/<picture>@3.bgra   the HD pictures, named as vkproxy matches the game's picture
   results.tsv           one row per catalogue object: the state, view, fit and errors
-  overrides.tsv         choices made by hand, per object label (tab separated):
-                        label, state, dynamic, view, mirror (true/false),
-                        "center" (put the object in the middle, e.g. where the game's
-                        picture left room for a shadow); an empty column keeps the
-                        search's choice; "label <tab> none" = no state matches (keep the
-                        game's picture). dynamic: on / off = all of the object's dynamic
-                        sprites, then each toggled while it helps; on:200,203 = exactly
-                        those SPR2 ids, on: = exactly none. '#' starts a comment.
+  overrides.tsv         choices made by hand, one object per line, tab separated:
+                          1 label, or <file.iff>:<label> when files share a label
+                          2 state; or "none": no state matches, keep the game's picture
+                          3 dynamic sprites: on / off = all of them, then each toggled
+                            while it helps; on:200,203 = exactly those SPR2 ids; on: = none
+                          4 view   5 mirror (true / false)
+                          6 placement: "center" (in the middle of the picture, e.g. where
+                            the game's picture left room for a shadow) or "box" (by the
+                            bounding boxes alone, when the colours differ too much for
+                            the colour fit to place it)
+                          7 draw this other object instead, [<file.iff>:]<label> (test
+                            objects that reuse the sand castle's picture)
+                          8 with 7: SPR2 ids to keep from the object's own file, with the
+                            palettes they use (a download whose picture shows a sister
+                            object's umbrella over its own blanket)
+                        an empty column keeps the search's choice; '#' starts a comment.
   approved.txt          pictures accepted by eye although they fail the checks
   rejected.txt          pictures found wrong by eye: never installed
   installed.txt         what --install put into the game (so it can take it out again)
+  ai.txt, ai/           pictures no sprite looks like (painted icons), upscaled by the AI
+                        instead (ai_pictures.py); installed unless rejected or drawn
 --install copies a picture when it passes the checks (colour error of the 1x assembly
 <= MAX_ERROR on both halves and overlap of the shapes >= MIN_OVERLAP), was approved, or
 had its state chosen by hand; never when rejected. Pictures installed before that no
@@ -42,6 +52,7 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):  # one
     os.environ.setdefault(_v, "1")
 
 import argparse  # noqa: E402
+import copy  # noqa: E402
 import shutil  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
@@ -77,7 +88,7 @@ def load_overrides(path: Path) -> dict[str, dict]:
     for line in path.read_text(encoding="utf-8-sig").splitlines():
         if not line.strip() or line.startswith("#"):
             continue
-        f = line.split("\t") + [""] * 6
+        f = line.split("\t") + [""] * 8
         if f[1].strip() == "none":
             out[f[0]] = {"none": True}
             continue
@@ -88,8 +99,15 @@ def load_overrides(path: Path) -> dict[str, dict]:
                      if dyn.startswith("on:") else {"on": True, "off": False}.get(dyn),
                      "view": int(f[3]) if f[3].strip() else None,
                      "mirror": flag.get(f[4].strip().lower()),
-                     "center": f[5].strip() == "center"}
+                     "center": f[5].strip() == "center", "box": f[5].strip() == "box",
+                     "from": f[6].strip() or None,
+                     "own": [int(x) for x in f[7].split(",") if x.strip()]}
     return out
+
+
+def override_for(overrides: dict, iff_name: str, label: str) -> dict:
+    """The choices for one object: by <file.iff>:<label> first, then by label."""
+    return overrides.get(f"{Path(iff_name).name}:{label}") or overrides.get(label) or {}
 
 
 def read_list(path: Path) -> set[str]:
@@ -120,6 +138,13 @@ def build_object(obj: objects.ObjectFile, sprites: assemble.Sprites, o: dict, ti
     # dynamic sprites are off unless the object's own code turns them on (fence posts, cake
     # candles, TV picture, food in the fridge...): try all off, all on, then each one toggled
     has_dynamic = any(t.get("dyn_n") for t in tiles)
+    def place_on(c):
+        """(mse, scale, x, y): the colour fit, or with "box" the bounding boxes alone."""
+        if not ov.get("box"):
+            return fit.fit(c, halves[0], bgs[0])
+        g = fit.first_guess(c, halves[0], bgs[0])
+        return None if g is None else (fit.quick_error(c, halves[0], bgs[0]), *g)
+
     scored = []
     for dyn in choices("dynamic", [False, True] if has_dynamic else [False]):
         for g in choices("graphic", range(graphics)):
@@ -139,7 +164,7 @@ def build_object(obj: objects.ObjectFile, sprites: assemble.Sprites, o: dict, ti
     scored.sort(key=lambda r: r[0])
     best = None
     for _q, g, view, dyn, mirror, c in scored[:CANDIDATES]:
-        f = fit.fit(c, halves[0], bgs[0])
+        f = place_on(c)
         if f and (best is None or f[0] < best[0][0]):
             best = (f, g, view, dyn, mirror, c)
     if best is None:
@@ -156,7 +181,7 @@ def build_object(obj: objects.ObjectFile, sprites: assemble.Sprites, o: dict, ti
                 ct = assemble.assemble(sprites, tiles, g, view, dynamic=frozenset(trial), mirror=mirror)
                 if ct is None or ct[..., 3].max() <= 0.5:
                     continue
-                f = fit.fit(ct, halves[0], bgs[0])
+                f = place_on(ct)
                 if f and f[0] < mse - 1e-9:
                     (mse, s, x, y), on, c, improved = f, trial, ct, True
         dyn = frozenset(on)
@@ -196,19 +221,60 @@ def build_file(job):
     sprites = assemble.Sprites(obj, sprites_dir)
     out = []
     for o, tiles in objects.catalogue_objects(obj):
-        if labels and o["label"] not in labels:
-            continue
+        if labels and o["label"] not in labels or override_for(overrides, name, o["label"]).get("from"):
+            continue  # pictures drawn from another object are built by main()
         pic = obj.picture(o)
         if pic is None or pic[:2] != objects.PICTURE_SIZE:
             continue
         try:
-            out.append(build_object(obj, sprites, o, tiles, overrides.get(o["label"], {})))
+            out.append(build_object(obj, sprites, o, tiles, override_for(overrides, name, o["label"])))
         except Exception as e:  # report it, don't lose the whole run
             row = dict(zip(HEADER, (name, o["label"], objects.picture_name(*pic), len(tiles), -1, -1, -1.0, -1.0,
                                     0.0, f"error {e!r}", 0.0, 0.0, f"{o['guid']:08x}", o["id"], o["catpic"], 0.0,
                                     False, False)))
             out.append((row, None))
     return out
+
+
+def build_borrowed(obj: objects.ObjectFile, o: dict, source: objects.ObjectFile, sprites_dir, ov: dict):
+    """(results row, HD picture) of an object whose picture shows another object, drawn from
+    that object's sprites (ov["from"] names it)."""
+    label = ov["from"].split(":", 1)[-1] if ".iff:" in ov["from"].lower() else ov["from"]
+    so, tiles = next(((so, t) for so, t in objects.catalogue_objects(source) if so["label"] == label), (None, None))
+    if so is None:
+        raise ValueError(f"{ov['from']!r} is not a catalogue object of {source.name}")
+    mixed = copy.copy(source)
+    mixed.bmp = dict(source.bmp)
+    mixed.bmp[o["catpic"]] = obj.bmp[o["catpic"]]
+    mixed.spr, mixed.pals = dict(source.spr), dict(source.pals)
+    kept_pals = set()
+    for sid in ov.get("own") or []:
+        mixed.spr[sid] = obj.spr[sid]
+        kept_pals.add(spr2.frame_offsets(obj.spr[sid])[0][1])
+    for pid in kept_pals:
+        users = [sid for sid, sd in source.spr.items() if sid not in ov["own"] and spr2.frame_offsets(sd)[0][1] == pid]
+        if users:
+            raise ValueError(f"palette {pid} is also used by SPR2 {users} of {source.name}")
+        mixed.pals[pid] = obj.pals[pid]
+    row, px = build_object(mixed, assemble.Sprites(mixed, sprites_dir), dict(so, catpic=o["catpic"]), tiles,
+                           {k: v for k, v in ov.items() if k not in ("from", "own")})
+    row.update(iff=obj.name, label=o["label"], guid=f"{o['guid']:08x}", objd_id=o["id"], bmp_id=o["catpic"])
+    return row, px
+
+
+def object_named(game: Path, spec: str):
+    """(object file, catalogue OBJD) named [<file.iff>:]<label>, or (None, None)."""
+    file, label = spec.split(":", 1) if ".iff:" in spec.lower() else ("", spec)
+    for pattern in (p for k in sorted(hd_art.PACKS) for p in hd_art.PACKS[k]):
+        for path in sorted(game.glob(pattern)):
+            for name, data in spr2.iter_iffs(path):
+                if file and Path(name).name.lower() != file.lower() or label.encode("latin-1", "ignore") not in data:
+                    continue
+                obj = objects.ObjectFile(data, name)
+                for o, _t in objects.catalogue_objects(obj):
+                    if o["label"] == label:
+                        return obj, o
+    return None, None
 
 
 def error_of(row) -> float:
@@ -231,7 +297,8 @@ def choose(rows, approved: set, rejected: set, overrides: dict) -> set[str]:
     chosen = set()
     for pic, r in best_rows(rows).items():
         passes = error_of(r) <= MAX_ERROR and float(r["iou"]) >= MIN_OVERLAP
-        by_hand = r["label"] in overrides and not overrides[r["label"]].get("none")
+        ov = override_for(overrides, r["iff"], r["label"])
+        by_hand = bool(ov) and not ov.get("none")
         if (passes or pic in approved or by_hand) and pic not in rejected:
             chosen.add(pic)
     return chosen
@@ -256,21 +323,26 @@ def write_results(path: Path, rows) -> None:
 def install(work: Path, game: Path, rows) -> None:
     chosen = choose(rows, read_list(work / "approved.txt"), read_list(work / "rejected.txt"),
                     load_overrides(work / "overrides.tsv"))
+    sources = {pic: work / "hd" / f"{pic}@3.bgra" for pic in chosen}
+    rejected = read_list(work / "rejected.txt")
+    for pic in read_list(work / "ai.txt"):  # painted icons upscaled by the AI (ai_pictures.py)
+        if pic not in sources and pic not in rejected:
+            sources[pic] = work / "ai" / f"{pic}@3.bgra"
     dest = game / "vkproxy" / "replace"
     dest.mkdir(parents=True, exist_ok=True)
     copied = removed = 0
-    for pic in sorted(chosen):
-        src, dst = work / "hd" / f"{pic}@3.bgra", dest / f"{pic}@3.bgra"
+    for pic, src in sorted(sources.items()):
+        dst = dest / f"{pic}@3.bgra"
         if not src.exists():
             continue
         if not dst.exists() or dst.read_bytes() != src.read_bytes():
             shutil.copyfile(src, dst)
             copied += 1
-    for pic in read_list(work / "installed.txt") - chosen:
+    for pic in read_list(work / "installed.txt") - set(sources):
         if (dest / f"{pic}@3.bgra").exists():
             (dest / f"{pic}@3.bgra").unlink()
             removed += 1
-    installed = sorted(p for p in chosen if (dest / f"{p}@3.bgra").exists())
+    installed = sorted(p for p in sources if (dest / f"{p}@3.bgra").exists())
     (work / "installed.txt").write_text("\n".join(installed) + "\n")
     print(f"installed {len(installed)} catalogue pictures ({copied} new or changed, {removed} taken out) "
           f"into {dest}; restart the game to see them")
@@ -313,6 +385,19 @@ def main(argv: list[str]) -> int:
                     pixels[(row["iff"], row["objd_id"])] = px
             if n % 200 == 0:
                 print(f"  {n} / {len(jobs)} files ({time.time() - t0:.0f} s)", flush=True)
+    for key, ov in overrides.items():  # pictures drawn from another object
+        label = key.split(":", 1)[-1] if ".iff:" in key.lower() else key
+        if not ov.get("from") or labels and label not in labels:
+            continue
+        obj, o = object_named(args.game, key)
+        source, _so = object_named(args.game, ov["from"])
+        if obj is None or source is None:
+            print("not found:", label if obj is None else ov["from"])
+            continue
+        row, px = build_borrowed(obj, o, source, sprites_dir, ov)
+        new_rows.append(row)
+        if px:
+            pixels[(row["iff"], row["objd_id"])] = px
     if labels:  # replace those objects' rows, keep the rest
         found = {r["label"] for r in new_rows}
         missing = labels - found

@@ -9,11 +9,13 @@ layout(set = 1, binding = 0) uniform sampler2D zbuf;
 layout(location = 0) in vec4 tint;
 layout(location = 1) in vec2 uv;
 layout(location = 2) in vec2 depth;
+layout(location = 3) flat in float rank;  // world_object.vert
 layout(location = 0) out vec4 colour;
 
 const float kShift = 0.1;
 layout(constant_id = 0) const int kPass = 0;  // see world_object.frag
 const float kOpaque = 0.999;
+const float kRankStep = 0.00000024;  // see world_object.frag
 
 void main() {
     vec2 at = uv + (dFdx(uv) + dFdy(uv)) * kShift;
@@ -23,7 +25,7 @@ void main() {
     if (kPass == 2 && c.w >= kOpaque) discard;
     float z = texture(zbuf, at).x;
     if (z >= 1.0) discard;
-    gl_FragDepth = mix(depth.x, depth.y, z * 1.0039370059967041015625);
+    gl_FragDepth = mix(depth.x, depth.y, z * 1.0039370059967041015625) - rank * kRankStep;
     colour = c;
     float y = dot(colour.xyz, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625));
     vec3 yiq = vec3(y, dot(colour.xyz, vec3(-0.1459999978542327880859375, -0.28799998760223388671875, 0.4339999854564666748046875)),

@@ -39,7 +39,24 @@ void main() {
     bool added = r < 128.0;
     float m = (added ? r : r - 128.0) / 127.0;
     if (m <= 0.0500000007450580596923828125) discard;
-    vec4 t = texture(wall, at * vec2(textureSize(mask, 0)) / vec2(textureSize(wall, 0)));
+    vec2 at_wall = at;
+    if (added) {
+        // a pixel the straight edges add outside the game's coverage: coloured from the nearest
+        // covered one, not from what the wall's texture holds there (a fence's wallpaper has its
+        // background there: light teeth along the top of a white railing)
+        vec2 px = 1.0 / vec2(textureSize(mask, 0));
+        float nearest = 1e9;
+        for (int dy = -3; dy <= 3; ++dy)
+            for (int dx = -3; dx <= 3; ++dx) {
+                vec2 q = at + vec2(dx, dy) * px;
+                float d = float(dx * dx + dy * dy);
+                if (d < nearest && texture(mask, q).x * 255.0 >= 127.5) {
+                    nearest = d;
+                    at_wall = q;
+                }
+            }
+    }
+    vec4 t = texture(wall, at_wall * vec2(textureSize(mask, 0)) / vec2(textureSize(wall, 0)));
     if (t.w <= 0.0) discard;
     vec3 d0 = world_pos - light0.xyz;
     float range = pc.light.y - pc.light.x;

@@ -50,17 +50,30 @@ instead of the system loader. It forwards every call to the real loader
   every sprite a tenth of a pixel right of and below the pixel centre. The object twins
   draw only opaque pixels; each such draw is repeated just before `vkCmdEndRenderPass`
   for the partly covered edge pixels (back to front by their vertices' farthest depth,
-  still writing depth), then the game's state is restored. The game's object order changes from frame to frame and sometimes puts a
+  still writing depth), then the game's state is restored. Object sprites also get
+  `src/world_object.vert` as vertex shader: each draw's rank within its depth band
+  (draws with the same vertex depths in the pass) comes in as firstInstance and brings it
+  a hair forward, so exact depth ties go to the later draw in both passes. Ranks are the
+  game's order within the band as last seen in order (the game moves the object under the
+  cursor, or just put down, to the end of its list), and sprites listed in
+  `<replace>/translucent.names` (`tools/hd_translucent.py`: mostly see-through in the
+  game's art, like a curtain or a handle) win those ties outright. The game's object order changes from frame to frame and sometimes puts a
   piece in front before the one behind it, and an edge pixel drawn then blended with
   the floor and kept the piece behind out (light dots along the edge). Floor tiles are
   split the same way (`tools/hd_floors.py` adds the partly covered pixels of their
   straightened outline outside their own), their partly covered pixels repeated before
   the first wall or object draw, without depth writes and a hair in front so they blend
-  over the next tile's stair-stepped teeth. The wall tops drawn with the walls down or
+  over the next tile's stair-stepped teeth. The wall tops drawn through the same pipeline
+  leave their partly covered pixels to the end of the pass, with the objects'. The wall tops drawn with the walls down or
   cut away (their own shader picks one of eight depths per texel from a second texture)
   give the pixels the HD wall tops add the farthest depth of the covered texels around
   them, pushed back a little. **F6** (or `world.toggle`) switches back to the game's
   shaders.
+- wall coverage masks (also fences: a fence is a wall whose mask is the fence's shape, a
+  wall style of walls.iff) are redrawn at 3x with straight anti-aliased edges; where none of
+  the wall slopes fits, 45 degree and steep lines are tried. The pixels they add outside the
+  game's coverage take their colour from the nearest covered pixel (`world_wall.frag`): a
+  fence's wallpaper holds its background there.
 - depth twins: each object sprite comes with a 1x depth texture (R8: the sprite's z, 0
   where it has no pixel, i.e. nearest). For a sprite whose HD coverage grows past the
   original (an outline rounded off by hand, `hd_art.py --install-edits`), a 3x depth

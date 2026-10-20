@@ -20,6 +20,8 @@ foreach ($shader in 'xbr', 'world_floor', 'world_wall', 'world_object', 'world_o
     & "$sdk\Bin\glslc.exe" -O -mfmt=c -o "$out\${shader}_frag.inc" "$root\src\$shader.frag"
     if ($LASTEXITCODE -ne 0) { throw "shader compile failed: $shader.frag" }
 }
+& "$sdk\Bin\glslc.exe" -O -mfmt=c -o "$out\world_object_vert.inc" "$root\src\world_object.vert"
+if ($LASTEXITCODE -ne 0) { throw "shader compile failed: world_object.vert" }
 
 & $cxx -std=c++17 -O2 -Wall -shared -static -o "$out\vulkan-1.dll" "$root\src\vkproxy.cpp" `
     "-I$sdk\Include" "-I$out" '-Wl,--kill-at'

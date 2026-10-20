@@ -52,6 +52,7 @@ from pathlib import Path
 import far
 import hd_composite
 import hd_floors
+import hd_translucent
 import hd_pack
 import iff
 import spr2
@@ -454,6 +455,8 @@ def main(argv: list[str]) -> int:
                 continue
             n += 1
         hd_pack.finish_install(dest)  # loose files into a pack: first opens are slow in game
+        if not (dest.folder / hd_translucent.FILE).exists():  # for vkproxy's depth ties
+            print(f"listed {hd_translucent.install(args.game)} mostly see-through sprites")
         print(f"installed {n} HD textures into {dest.folder} ({lap()}; restart the game to load them)")
     return 0
 

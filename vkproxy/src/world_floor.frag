@@ -31,9 +31,12 @@ const float kAddedBehind = 0.0005;  // see world_wall.frag
 // Floor tiles (odd widths; wall tops are even) from tools/hd_floors.py have their own pixels
 // opaque and, outside them, the partly covered pixels of their straightened outline. Which this
 // pipeline draws (vkproxy.cpp, g_world_partial): 0 all; 1 the opaque ones, as the game draws
-// a tile; 2 the partly covered ones, once every floor tile is drawn (before the walls), without
-// depth writes and a hair in front, so that they win the tie with the tile next to them, on
-// the same plane, and blend over its stair-stepped teeth.
+// a tile or wall top; 2 the floor tiles' partly covered ones, once every floor tile is drawn
+// (before the walls), without depth writes and a hair in front, so that they win the tie with
+// the tile next to them, on the same plane, and blend over its stair-stepped teeth; 3 the wall
+// tops' partly covered ones, at the end of the pass with the objects' (writing depth). Drawn
+// with the rest of a wall top, before the wall face under it, its soft lower edge blended with
+// the room behind the wall and kept the face out: white dots along the wall top.
 layout(constant_id = 0) const int kPass = 0;
 const float kFringeAhead = 0.00001;
 
@@ -57,8 +60,10 @@ void main() {
     float a = floor(t.w * 255.0 + 0.5);
     bool tile = (int(size.x) & 1) == 1;
     bool fringe = tile && a < 255.0;
-    if (kPass == 1 && fringe) discard;
+    bool soft = !tile && a < 255.0;  // a wall top's partly covered pixel
+    if (kPass == 1 && (fringe || soft)) discard;
     if (kPass == 2 && !fringe) discard;
+    if (kPass == 3 && !soft) discard;
     vec3 d0 = world_pos - light0.xyz;
     float range = pc.light.y - pc.light.x;
     float f0 = 1.0 - pow(clamp((dot(d0, d0) - pc.light.x) / range, 0.0, 1.0), pc.light.z);

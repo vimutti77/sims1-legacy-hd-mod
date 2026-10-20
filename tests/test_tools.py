@@ -20,6 +20,7 @@ import iff  # noqa: E402
 import hd_art  # noqa: E402
 import hd_composite  # noqa: E402
 import hd_floors  # noqa: E402
+import hd_translucent  # noqa: E402
 import hd_pack  # noqa: E402
 import hd_shapes  # noqa: E402
 import hd_ui  # noqa: E402
@@ -568,6 +569,25 @@ class StairsTests(unittest.TestCase):
         inv = bytes(1 - v for v in m)
         a, b = stairs.upscale(m, self.W, self.H), stairs.upscale(inv, self.W, self.H)
         self.assertTrue(all(abs(x + y - 255) <= 16 for x, y in zip(a, b)))
+
+
+class HdTranslucentTests(unittest.TestCase):
+    @staticmethod
+    def sprite(alphas: list[int]) -> bytes:
+        return b"".join(bytes((10, 20, 30, a)) for a in alphas)
+
+    def test_mostly_partly_covered_sprites_count(self):
+        self.assertTrue(hd_translucent.is_translucent(self.sprite([0, 0, 128, 128, 255])))  # 2 of 3 drawn
+        self.assertTrue(hd_translucent.is_translucent(self.sprite([0, 100, 255])))  # half
+        self.assertFalse(hd_translucent.is_translucent(self.sprite([0, 128, 255, 255])))  # 1 of 3
+        self.assertFalse(hd_translucent.is_translucent(self.sprite([0, 0, 0])))  # nothing drawn
+
+    def test_install_writes_the_list(self):
+        with tempfile.TemporaryDirectory() as d:
+            n = hd_translucent.install(Path(d), ["8x8_00aa", "4x24_7a35"])
+            self.assertEqual(n, 2)
+            text = (Path(d) / "vkproxy" / "replace" / hd_translucent.FILE).read_text(encoding="ascii")
+            self.assertEqual(text.split(), ["8x8_00aa", "4x24_7a35"])
 
 
 class HdFloorsTests(unittest.TestCase):

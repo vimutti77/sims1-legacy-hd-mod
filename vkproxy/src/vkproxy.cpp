@@ -74,20 +74,25 @@ const uint32_t kWorldObjectYiqFrag[] =
 const uint32_t kWorldWallTopFrag[] =
 #include "world_wall_top_frag.inc"
     ;
+const uint32_t kWorldObjectVert[] =
+#include "world_object_vert.inc"
+    ;
 struct WorldShader {
     const char* game;  // the game's fragment shader it replaces
     const uint32_t* code;
     size_t size;
     bool split;  // drawn in two parts: opaque pixels, then the partly covered ones (g_world_partial)
+    bool ranked;  // with world_object.vert as vertex shader: draws ranked by object_rank
 };
 const int kWorldFloor = 0;  // kWorldShaders index of the floor tiles' shader
 const WorldShader kWorldShaders[] = {
-    {"shader_63b9db14d8318909.spv", kWorldFloorFrag, sizeof kWorldFloorFrag, true},          // floors, wall tops
-    {"shader_dfa0d8fccf7ee369.spv", kWorldWallFrag, sizeof kWorldWallFrag, false},           // walls
-    {"shader_b2e55b6e3b04a39c.spv", kWorldObjectFrag, sizeof kWorldObjectFrag, true},        // objects
-    {"shader_c616498e50bad3d1.spv", kWorldObjectYiqFrag, sizeof kWorldObjectYiqFrag, true},  // objects, brightened
-    {"shader_ccd02c43ced1b15e.spv", kWorldWallTopFrag, sizeof kWorldWallTopFrag, false},     // wall tops, walls down
+    {"shader_63b9db14d8318909.spv", kWorldFloorFrag, sizeof kWorldFloorFrag, true, false},          // floors, wall tops
+    {"shader_dfa0d8fccf7ee369.spv", kWorldWallFrag, sizeof kWorldWallFrag, false, false},           // walls
+    {"shader_b2e55b6e3b04a39c.spv", kWorldObjectFrag, sizeof kWorldObjectFrag, true, true},         // objects
+    {"shader_c616498e50bad3d1.spv", kWorldObjectYiqFrag, sizeof kWorldObjectYiqFrag, true, true},   // objects, brightened
+    {"shader_ccd02c43ced1b15e.spv", kWorldWallTopFrag, sizeof kWorldWallTopFrag, false, false},     // wall tops, walls down
 };
+const char* const kObjectVertexShader = "shader_f21725c4dec90cbe.spv";  // the game's, as world_object.vert
 
 std::recursive_mutex g_mu;
 FILE* g_log = nullptr;
@@ -296,6 +301,7 @@ struct DrawArgs {
 // An object draw's partly covered pixels, drawn again at the end of the pass (see g_world_partial).
 struct Deferred {
     uint64_t game_pipeline = 0;              // the game's (for its vertex layout)
+    uint32_t depth_location = 3;             // vertex attribute with (nearest, farthest) depth
     float key = 0;                           // objects: the farthest depth of its vertices
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;  // the pipeline's: sets and push constants go with it
@@ -336,6 +342,9 @@ struct CmdState {
     std::vector<Deferred> deferred;        // objects': drawn at the end of the pass
     std::vector<Deferred> deferred_floor;  // floor tiles': before the next wall or object draw
     std::vector<Deferred> sorted;          // the objects' as sorted, to check their keys at submit
+    uint64_t band = 0;                     // object_rank: the depth band being drawn
+    bool band_open = false;
+    std::unordered_set<uint64_t> closed_bands;  // and those drawn before it in this pass
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -363,8 +372,13 @@ std::unordered_map<uint64_t, VkPipeline> g_world_partial;  // game pipeline -> p
 // outline lie outside their own), but repeated once the floor tiles are drawn, before the
 // first wall or object: drawn later, they would win ties with the bottom rows of walls.
 std::unordered_map<uint64_t, int> g_world_kind;  // game pipeline -> its kWorldShaders index
+// The floor pipeline also draws the wall tops: their partly covered pixels go with the objects'
+// (world_floor.frag, kPass 3), not before the walls.
+std::unordered_map<uint64_t, VkPipeline> g_world_top_partial;  // floor pipeline -> wall tops' partly covered pixels
 std::unordered_map<uint64_t, uint64_t> g_world_layout;  // game pipeline (with a world twin) -> its layout
+std::unordered_set<uint64_t> g_world_ranked;               // game pipelines whose twins take a rank (object_rank)
 VkShaderModule g_world_modules[std::size(kWorldShaders)] = {};
+VkShaderModule g_world_vert_module = VK_NULL_HANDLE;  // world_object.vert
 std::unordered_map<VkCommandBuffer, CmdState> g_cmd;
 std::unordered_map<uint64_t, Replacement> g_replace;        // VkImage -> replacement pixels
 std::unordered_map<std::string, Staging> g_staging;         // replacement file -> staging buffer
@@ -453,6 +467,10 @@ std::set<std::string> g_dumped;
 std::set<std::string> g_fetched;
 // World draw log state (see g_names_on).
 std::unordered_map<uint64_t, std::string> g_image_name;  // VkImage -> content name of its last upload
+// Object sprites that are mostly see-through in the game's art (tools/hd_translucent.py,
+// <replace>/translucent.names): they win ties at the very same depth (object_rank).
+std::unordered_set<std::string> g_translucent;
+std::unordered_set<uint64_t> g_translucent_images;  // VkImages whose last upload is one of them
 struct PipeInfo {
     std::string vs, fs;
     std::vector<VkVertexInputBindingDescription> bindings;
@@ -621,6 +639,7 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyImage(VkDevice d, VkImage image, const Vk
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         g_images.erase((uint64_t)image);
         g_image_name.erase((uint64_t)image);
+        g_translucent_images.erase((uint64_t)image);
         if (g_replace.erase((uint64_t)image)) g_freed_replaced.insert((uint64_t)image);
         auto hd = g_hd.find((uint64_t)image);
         if (hd != g_hd.end()) {  // kept for reuse (see Twin)
@@ -743,13 +762,18 @@ bool own_module(VkDevice d, const uint32_t* code, size_t size, VkShaderModule* m
 // Create a copy of a game pipeline whose fragment stage is `fs` instead (specialised with
 // `spec`), optionally without depth writes.
 VkPipeline make_twin(VkDevice d, VkPipelineCache c, const VkGraphicsPipelineCreateInfo& src, VkShaderModule fs,
-                     const VkSpecializationInfo* spec = nullptr, bool no_depth_write = false) {
+                     const VkSpecializationInfo* spec = nullptr, bool no_depth_write = false,
+                     VkShaderModule vs = VK_NULL_HANDLE) {
     std::vector<VkPipelineShaderStageCreateInfo> stages(src.pStages, src.pStages + src.stageCount);
     for (auto& s : stages)
         if (s.stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
             s.module = fs;
             s.pName = "main";
             s.pSpecializationInfo = spec;
+        } else if (s.stage == VK_SHADER_STAGE_VERTEX_BIT && vs) {
+            s.module = vs;
+            s.pName = "main";
+            s.pSpecializationInfo = nullptr;
         }
     VkGraphicsPipelineCreateInfo ci = src;
     ci.pStages = stages.data();
@@ -780,6 +804,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
             std::string stages;
             bool quad_fs = false;
             int world = -1;  // index into kWorldShaders
+            std::string pi_vs;  // the vertex shader's spv file
             for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
                 auto m = g_modules.find((uint64_t)ci[i].pStages[s].module);
                 bool fs = ci[i].pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -788,7 +813,12 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
                 if (fs && m != g_modules.end() && m->second == kQuadFragShader) quad_fs = true;
                 for (int w = 0; fs && m != g_modules.end() && w < static_cast<int>(std::size(kWorldShaders)); ++w)
                     if (m->second == kWorldShaders[w].game) world = w;
+                if (!fs && ci[i].pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT && m != g_modules.end()) pi_vs = m->second;
             }
+            bool per_instance = false;
+            if (const VkPipelineVertexInputStateCreateInfo* vi = ci[i].pVertexInputState)
+                for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; ++b)
+                    per_instance |= vi->pVertexBindingDescriptions[b].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
             const char* blend = "?";
             if (ci[i].pColorBlendState && ci[i].pColorBlendState->attachmentCount)
                 blend = ci[i].pColorBlendState->pAttachments[0].blendEnable ? "blend" : "opaque";
@@ -817,30 +847,47 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
             if (world >= 0) {
                 const WorldShader& ws = kWorldShaders[world];
                 // kPass (constant_id 0 in world_object.frag): 0 all pixels, 1 opaque, 2 the rest
-                static const int32_t kPasses[3] = {0, 1, 2};
+                static const int32_t kPasses[4] = {0, 1, 2, 3};
                 VkSpecializationMapEntry entry{0, 0, sizeof(int32_t)};
-                VkSpecializationInfo spec[3];
-                for (int k = 0; k < 3; ++k) spec[k] = {1, &entry, sizeof(int32_t), &kPasses[k]};
-                VkPipeline twin = VK_NULL_HANDLE, partial = VK_NULL_HANDLE;
+                VkSpecializationInfo spec[4];
+                for (int k = 0; k < 4; ++k) spec[k] = {1, &entry, sizeof(int32_t), &kPasses[k]};
+                VkPipeline twin = VK_NULL_HANDLE, partial = VK_NULL_HANDLE, top_partial = VK_NULL_HANDLE;
+                auto destroy = reinterpret_cast<PFN_vkDestroyPipeline>(real_GDPA(d, "vkDestroyPipeline"));
+                // the objects' vertex shader too, when it is the one world_object.vert reproduces and
+                // no vertex attribute steps per instance (firstInstance then only carries the rank)
+                VkShaderModule vs = VK_NULL_HANDLE;
+                if (ws.ranked && pi_vs == kObjectVertexShader && !per_instance &&
+                    own_module(d, kWorldObjectVert, sizeof kWorldObjectVert, &g_world_vert_module))
+                    vs = g_world_vert_module;
                 if (own_module(d, ws.code, ws.size, &g_world_modules[world])) {
                     // floor tiles' partly covered pixels lie on the next tile (same depth): no depth writes,
                     // or the walls drawn next would lose ties along their bottom row; objects' do write,
                     // so that among the repeated draws the pieces in front still hide those behind
                     if (ws.split)
-                        partial = make_twin(d, c, ci[i], g_world_modules[world], &spec[2], world == kWorldFloor);
-                    twin = make_twin(d, c, ci[i], g_world_modules[world], ws.split ? &spec[partial ? 1 : 0] : nullptr);
-                    if (partial && !twin) {
-                        auto destroy = reinterpret_cast<PFN_vkDestroyPipeline>(real_GDPA(d, "vkDestroyPipeline"));
-                        if (destroy) destroy(d, partial, nullptr);
-                        partial = VK_NULL_HANDLE;
+                        partial = make_twin(d, c, ci[i], g_world_modules[world], &spec[2], world == kWorldFloor, vs);
+                    if (partial && world == kWorldFloor) {
+                        top_partial = make_twin(d, c, ci[i], g_world_modules[world], &spec[3]);
+                        if (!top_partial) {  // split all or nothing: pass 1 leaves the wall tops' soft pixels out
+                            if (destroy) destroy(d, partial, nullptr);
+                            partial = VK_NULL_HANDLE;
+                        }
+                    }
+                    twin = make_twin(d, c, ci[i], g_world_modules[world], ws.split ? &spec[partial ? 1 : 0] : nullptr,
+                                     false, vs);
+                    if (!twin) {
+                        for (VkPipeline* x : {&partial, &top_partial})
+                            if (*x && destroy) destroy(d, *x, nullptr);
+                        partial = top_partial = VK_NULL_HANDLE;
                     }
                 }
                 if (twin) g_world_twin[(uint64_t)out[i]] = twin;
                 if (partial) g_world_partial[(uint64_t)out[i]] = partial;
+                if (top_partial) g_world_top_partial[(uint64_t)out[i]] = top_partial;
                 g_world_kind[(uint64_t)out[i]] = world;
+                if (vs) g_world_ranked.insert((uint64_t)out[i]);
                 g_world_layout[(uint64_t)out[i]] = (uint64_t)ci[i].layout;
-                logf("  world twin for pipe#%u (%s): %s%s", id, ws.game, twin ? "ok" : "FAILED",
-                     ws.split ? (partial ? ", split" : ", NOT split") : "");
+                logf("  world twin for pipe#%u (%s): %s%s%s", id, ws.game, twin ? "ok" : "FAILED",
+                     ws.split ? (partial ? ", split" : ", NOT split") : "", vs ? ", ranked" : "");
             }
         }
     }
@@ -952,6 +999,8 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkR
     st.in_pass = true;
     st.deferred.clear();
     st.deferred_floor.clear();
+    st.band_open = false;
+    st.closed_bands.clear();
     if (scale > 1) apply_dynamic_state(cb, st, scale);
 }
 
@@ -1184,6 +1233,21 @@ void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
     d.pipeline = partial->second;
     d.layout = (VkPipelineLayout)layout->second;
     d.sets = kind->second == kWorldFloor ? 1 : 2;  // floors: the texture; objects: texture and depth
+    bool top = false;  // a wall top (even width) through the floor pipeline
+    if (kind->second == kWorldFloor) {
+        d.depth_location = 4;
+        auto set = st.sets.empty() ? g_sets.end() : g_sets.find(st.sets[0]);
+        if (set != g_sets.end() && !set->second.empty()) {
+            auto v = g_view_image.find(set->second[0].view);
+            auto im = v == g_view_image.end() ? g_images.end() : g_images.find(v->second);
+            top = im != g_images.end() && im->second.w % 2 == 0;
+        }
+        if (top) {
+            auto tp = g_world_top_partial.find(st.pipeline);
+            if (tp == g_world_top_partial.end()) return;
+            d.pipeline = tp->second;
+        }
+    }
     for (size_t s = 0; s < d.sets; ++s) {
         d.set[s] = hb.ours[s] ? hb.ours[s] : s < st.sets.size() ? (VkDescriptorSet)st.sets[s] : VK_NULL_HANDLE;
         // these sets hold one texture each; one with dynamic offsets is not ours to repeat
@@ -1204,7 +1268,7 @@ void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
     d.args = args;
     d.viewports = st.viewports;
     d.scissors = st.scissors;
-    (kind->second == kWorldFloor ? st.deferred_floor : st.deferred).push_back(std::move(d));
+    (kind->second == kWorldFloor && !top ? st.deferred_floor : st.deferred).push_back(std::move(d));
 }
 
 void issue_pushes(VkCommandBuffer cb, std::vector<PushRec> pushes) {
@@ -1235,37 +1299,135 @@ void issue_dynamic_state(VkCommandBuffer cb, const std::vector<VkViewport>& vp, 
 
 const char* mapped_at(uint64_t buffer, VkDeviceSize off, VkDeviceSize len);
 
-// The farthest depth among a deferred object draw's vertices (vertex attribute 3: nearest and
-// farthest depth), from the game's mapped vertex buffer; false if it cannot be read.
-bool far_depth(const Deferred& d, float* out) {
+// Vertex k's attribute at location (floats, n of them) of a draw, from the game's mapped vertex
+// buffer; false if it cannot be read.
+bool vertex_floats(const Deferred& d, uint32_t k, uint32_t location, VkFormat format, float* out, uint32_t n) {
     auto pi = g_pipe_info.find(d.game_pipeline);
     if (pi == g_pipe_info.end()) return false;
     const VkVertexInputAttributeDescription* attr = nullptr;
     for (auto& a : pi->second.attrs)
-        if (a.location == 3 && a.format == VK_FORMAT_R32G32_SFLOAT) attr = &a;
+        if (a.location == location && a.format == format) attr = &a;
     if (!attr || attr->binding >= d.vbs.size()) return false;
     uint32_t stride = 0;
     for (auto& b : pi->second.bindings)
         if (b.binding == attr->binding) stride = b.stride;
+    int64_t vertex = d.args.first + k;
+    if (d.args.indexed) {
+        size_t isz = d.ib_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+        const char* ip = mapped_at(d.ib, d.ib_off + (d.args.first + k) * isz, isz);
+        if (!ip) return false;
+        vertex = (isz == 4 ? *reinterpret_cast<const uint32_t*>(ip) : *reinterpret_cast<const uint16_t*>(ip)) +
+                 static_cast<int64_t>(d.args.vertex_offset);
+    }
+    const char* p = mapped_at(d.vbs[attr->binding].first, d.vbs[attr->binding].second + vertex * stride + attr->offset,
+                              n * sizeof(float));
+    if (!p) return false;
+    memcpy(out, p, n * sizeof(float));
+    return true;
+}
+
+// Vertex k's depths (vertex attribute 3 of the object sprites, 4 of the floor pipeline's:
+// nearest and farthest).
+bool vertex_depths(const Deferred& d, uint32_t k, float z[2]) {
+    return vertex_floats(d, k, d.depth_location, VK_FORMAT_R32G32_SFLOAT, z, 2);
+}
+
+// The farthest depth among a deferred object draw's vertices.
+bool far_depth(const Deferred& d, float* out) {
     uint32_t n = std::min(d.args.count, 64u);
     float farthest = -1;
     for (uint32_t k = 0; k < n; ++k) {
-        int64_t vertex = d.args.first + k;
-        if (d.args.indexed) {
-            size_t isz = d.ib_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
-            const char* ip = mapped_at(d.ib, d.ib_off + (d.args.first + k) * isz, isz);
-            if (!ip) return false;
-            vertex = (isz == 4 ? *reinterpret_cast<const uint32_t*>(ip) : *reinterpret_cast<const uint16_t*>(ip)) +
-                     static_cast<int64_t>(d.args.vertex_offset);
-        }
-        const char* p = mapped_at(d.vbs[attr->binding].first, d.vbs[attr->binding].second + vertex * stride + attr->offset, 8);
-        if (!p) return false;
         float z[2];
-        memcpy(z, p, sizeof z);
+        if (!vertex_depths(d, k, z)) return false;
         farthest = std::max(farthest, z[1]);
     }
     *out = farthest;
     return n > 0;
+}
+
+// An object sprite draw's rank (world_object.vert) among the draws of its depth band (the game
+// gives a whole diagonal row of the lot the same vertex depths, and draws the bands far to
+// near), at most kMaxRank, passed as firstInstance (0 where the twin does not take it).
+// Ranks are the game's order within the band as last seen in order. The game moves the object
+// under the cursor (also one just put down) to the end of its list, out of its band, and two
+// objects at the very same depth then swapped which one showed (a curtain and the window behind
+// it). A draw whose band came and went earlier in the pass is such a moved one: it keeps the
+// rank it had in order, or, never seen in order, wins its ties as in the game, and is not kept.
+const uint32_t kMaxRank = 60;
+struct RankBook {
+    std::unordered_map<uint64_t, std::vector<uint64_t>> last;  // band -> its draws in rank order, as kept
+    // band -> this frame's (rank, arrival, draw); a draw not kept yet takes the rank of the draw
+    // before it in the band and then sorts after it (by arrival)
+    std::unordered_map<uint64_t, std::vector<std::tuple<uint32_t, uint32_t, uint64_t>>> now;
+} g_ranks;
+
+// At present: this frame's order (draws seen in order, and kept ones seen moved) is kept.
+void commit_ranks() {
+    g_ranks.last.clear();
+    for (auto& [band, v] : g_ranks.now) {
+        std::sort(v.begin(), v.end());
+        auto& ids = g_ranks.last[band];
+        for (auto& e : v) ids.push_back(std::get<2>(e));
+    }
+    g_ranks.now.clear();
+}
+
+uint64_t mix64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+uint32_t object_rank(VkCommandBuffer cb, const DrawArgs& a) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    CmdState& st = g_cmd[cb];
+    if (!st.in_pass || !g_world_on || a.first_instance != 0 || a.instances != 1 || !a.count) return 0;
+    if (!g_world_ranked.count(st.pipeline)) return 0;
+    auto twin = g_world_twin.find(st.pipeline);
+    if (twin == g_world_twin.end() || st.bound != (uint64_t)twin->second) return 0;
+    Deferred d;
+    d.game_pipeline = st.pipeline;
+    d.vbs = st.vbs;
+    d.ib = st.ib;
+    d.ib_off = st.ib_off;
+    d.ib_type = st.ib_type;
+    d.args = a;
+    float z[2], pos[3];
+    if (!vertex_depths(d, 0, z) || !vertex_floats(d, 0, 0, VK_FORMAT_R32G32B32_SFLOAT, pos, 3)) return 0;
+    uint32_t zb[2], pb[3];
+    memcpy(zb, z, sizeof zb);
+    memcpy(pb, pos, sizeof pb);
+    uint64_t band = (static_cast<uint64_t>(zb[0]) << 32) | zb[1];
+    uint64_t texture = st.sets.empty() ? 0 : st.sets[0];  // the game's set: one texture
+    auto set = g_sets.find(texture);
+    if (set != g_sets.end() && !set->second.empty()) {
+        auto v = g_view_image.find(set->second[0].view);
+        if (v != g_view_image.end()) texture = v->second;
+    }
+    uint64_t id = mix64(mix64(mix64(mix64(band, texture), pb[0]), pb[1]), pb[2]);
+    // moved: its band came and went earlier in this pass
+    bool moved = false;
+    if (!st.band_open || st.band != band) {
+        if (st.closed_bands.count(band)) {
+            moved = true;
+        } else {
+            if (st.band_open) st.closed_bands.insert(st.band);
+            st.band = band;
+            st.band_open = true;
+        }
+    }
+    int known = -1;
+    auto last = g_ranks.last.find(band);
+    if (last != g_ranks.last.end()) {
+        auto at = std::find(last->second.begin(), last->second.end(), id);
+        if (at != last->second.end()) known = static_cast<int>(at - last->second.begin());
+    }
+    // mostly see-through sprites (a curtain over a window, a handle) win the ties outright
+    uint32_t lead = g_translucent_images.count(texture) ? kMaxRank + 1 : 0;
+    if (known < 0 && moved) return kMaxRank + lead;
+    auto& now = g_ranks.now[band];
+    uint32_t rank = known >= 0 ? static_cast<uint32_t>(known) : now.empty() ? 0 : std::get<0>(now.back());
+    now.emplace_back(rank, static_cast<uint32_t>(now.size()), id);
+    return std::min(rank, kMaxRank) + lead;
 }
 
 // The deferred draws' partly covered pixels (st.deferred or st.deferred_floor), then the game's
@@ -1281,7 +1443,9 @@ void flush_partial(VkCommandBuffer cb, bool floors) {
         bool keyed = true;
         for (auto& d : list) keyed = keyed && far_depth(d, &d.key);
         if (keyed) {
-            std::stable_sort(list.begin(), list.end(), [](const Deferred& a, const Deferred& b) { return a.key > b.key; });
+            std::stable_sort(list.begin(), list.end(), [](const Deferred& a, const Deferred& b) {
+                return a.key != b.key ? a.key > b.key : a.args.first_instance < b.args.first_instance;  // then by rank
+            });
             st.sorted.insert(st.sorted.end(), list.begin(), list.end());
         } else {
             static unsigned warned = 0;
@@ -1404,14 +1568,17 @@ void record_draw(VkCommandBuffer cb, bool indexed, uint32_t first, uint32_t coun
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
     record_draw(cb, false, fv, vc, 0);
-    substituted_draw(cb, "draw", DrawArgs{false, vc, ic, fv, 0, fi}, [&] { real_vkCmdDraw(cb, vc, ic, fv, fi); });
+    DrawArgs args{false, vc, ic, fv, 0, fi};
+    args.first_instance += object_rank(cb, args);
+    substituted_draw(cb, "draw", args, [&] { real_vkCmdDraw(cb, vc, ic, fv, args.first_instance); });
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_t ic, uint32_t fi,
                                                 int32_t vo, uint32_t fin) {
     record_draw(cb, true, fi, n, vo);
-    substituted_draw(cb, "drawIndexed", DrawArgs{true, n, ic, fi, vo, fin},
-                     [&] { real_vkCmdDrawIndexed(cb, n, ic, fi, vo, fin); });
+    DrawArgs args{true, n, ic, fi, vo, fin};
+    args.first_instance += object_rank(cb, args);
+    substituted_draw(cb, "drawIndexed", args, [&] { real_vkCmdDrawIndexed(cb, n, ic, fi, vo, args.first_instance); });
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n,
@@ -1815,12 +1982,16 @@ void magnify(unsigned char* dst, const unsigned char* src, uint32_t w, uint32_t 
 // the line through its neighbourhood is fitted: for each slope (+1/2, -1/2, 0, vertical) and
 // side, the pixel centres bound its offset to an interval; the widest feasible one wins, its
 // middle is taken; smaller neighbourhoods are tried near corners; with no line, nearest.
+// Fences (walls.iff wall styles: the same masks) have edges at other angles too: where no wall
+// slope fits, 45 degree and steep lines (+-1, +-2) are tried, so a wall's own edges come out
+// as before (an iron fence's diagonal bars were left as stairs).
 struct StairLine {
-    int slope;  // index into kStairSlopes, or 3: vertical
+    int slope;  // index into kStairSlopes, or kStairVertical
     double c;
     bool below;  // inside is below (right of) the line
 };
-const double kStairSlopes[3] = {0.5, -0.5, 0.0};
+const double kStairSlopes[7] = {0.5, -0.5, 0.0, 1.0, -1.0, 2.0, -2.0};
+const int kStairVertical = 7;
 const int kStairWindows[3][2] = {{3, 2}, {2, 1}, {1, 1}};
 const int kStairSamples = 4;
 // A wall face's sloped top edge is moved this far up (1x pixels): the wall top drawn on it has
@@ -1831,15 +2002,17 @@ const double kWallTopGrow = 0.4;
 
 bool stair_fit(const unsigned char* m, int w, int h, int x, int y, StairLine* line) {
     const double inf = 1e300;
+    static const int kWallSlopes[] = {0, 1, 2, kStairVertical}, kMoreSlopes[] = {3, 4, 5, 6};
+    for (int more = 0; more < 2; ++more)
     for (auto& win : kStairWindows) {
         double best = -1;
-        for (int si = 0; si < 4; ++si)
+        for (int si : more ? kMoreSlopes : kWallSlopes)
             for (int below = 1; below >= 0; --below) {
                 double lo = -inf, hi = inf;
                 for (int py = std::max(0, y - win[1]); py <= std::min(h - 1, y + win[1]); ++py)
                     for (int px = std::max(0, x - win[0]); px <= std::min(w - 1, x + win[0]); ++px) {
                         double cx = px + 0.5, cy = py + 0.5;
-                        double v = si == 3 ? cx : cy - kStairSlopes[si] * cx;
+                        double v = si == kStairVertical ? cx : cy - kStairSlopes[si] * cx;
                         if ((m[py * w + px] != 0) == (below != 0))
                             hi = std::min(hi, v);
                         else
@@ -1878,7 +2051,7 @@ void stair_coverage(unsigned char* dst, const unsigned char* m, int w, int h, in
                         for (int b = 0; b < kStairSamples; ++b)
                             for (int a = 0; a < kStairSamples; ++a) {
                                 double sx = (X + (a + 0.5) / kStairSamples) / s, sy = (Y + (b + 0.5) / kStairSamples) / s;
-                                double t = line.slope == 3 ? sx : sy - kStairSlopes[line.slope] * sx;
+                                double t = line.slope == kStairVertical ? sx : sy - kStairSlopes[line.slope] * sx;
                                 hits += line.below ? t >= line.c : t <= line.c;
                             }
                         v = static_cast<unsigned char>((hits * 255 + n / 2) / n);
@@ -2243,6 +2416,16 @@ void scan_hd_files() {
         if (index_file(n)) g_packed.erase(n);
     logf("hd: %u packs (%u files in them), %u loose files, indexed in %.0f ms", static_cast<unsigned>(packs.size()),
          static_cast<unsigned>(g_packed.size()), static_cast<unsigned>(loose.size()), now_ms() - t0);
+    if (FILE* f = fopen((g_replace_dir + "\\translucent.names").c_str(), "rb")) {
+        char line[128];
+        while (fgets(line, sizeof line, f)) {
+            std::string n(line);
+            while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
+            if (!n.empty()) g_translucent.insert(n);
+        }
+        fclose(f);
+        logf("hd: %u mostly see-through sprites listed", static_cast<unsigned>(g_translucent.size()));
+    }
     // wall coverage masks: "WMSK", u32 w, h, count, then count x w*h bytes
     find = FindFirstFileA((g_replace_dir + "\\*.wallmasks").c_str(), &fd);
     if (find != INVALID_HANDLE_VALUE) {
@@ -2526,6 +2709,12 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
             g_perf.hash += now_ms() - t0;
             ++g_perf.hashed;
         }
+    if (colour) {
+        if (!name.empty() && g_translucent.count(name))
+            g_translucent_images.insert((uint64_t)dst);
+        else
+            g_translucent_images.erase((uint64_t)dst);
+    }
     if (existing != g_hd.end()) {
         if (existing->second.name == name) return;  // same pixels again: the twin is still right
         release_twin(existing->second.name);        // new pixels; the old twin may still be in flight
@@ -2817,8 +3006,12 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
         for (auto& t : g_world_partial)
             if (destroy_pipeline) destroy_pipeline(d, t.second, nullptr);
         g_world_partial.clear();
+        for (auto& t : g_world_top_partial)
+            if (destroy_pipeline) destroy_pipeline(d, t.second, nullptr);
+        g_world_top_partial.clear();
         g_world_kind.clear();
         g_world_layout.clear();
+        g_world_ranked.clear();
         for (auto& m : g_world_modules) {
             if (m && destroy_module) destroy_module(d, m, nullptr);
             m = VK_NULL_HANDLE;
@@ -3052,6 +3245,7 @@ void write_bench() {
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR* pi) {
     VkResult r = real_vkQueuePresentKHR(q, pi);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
+    commit_ranks();
     if (r != VK_SUCCESS) {
         static unsigned logged = 0;
         if (logged++ < 20) logf("ERROR vkQueuePresentKHR -> %d at frame %u", static_cast<int>(r), g_frame);

@@ -295,6 +295,8 @@ struct DrawArgs {
 };
 // An object draw's partly covered pixels, drawn again at the end of the pass (see g_world_partial).
 struct Deferred {
+    uint64_t game_pipeline = 0;              // the game's (for its vertex layout)
+    float key = 0;                           // objects: the farthest depth of its vertices
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;  // the pipeline's: sets and push constants go with it
     uint32_t sets = 0;                         // how many of set[] its shader uses
@@ -333,6 +335,7 @@ struct CmdState {
     std::vector<PushRec> pushes;                      // the last push for each set of stages
     std::vector<Deferred> deferred;        // objects': drawn at the end of the pass
     std::vector<Deferred> deferred_floor;  // floor tiles': before the next wall or object draw
+    std::vector<Deferred> sorted;          // the objects' as sorted, to check their keys at submit
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -350,8 +353,9 @@ std::unordered_map<uint64_t, VkPipeline> g_world_twin;      // game pipeline -> 
 // the one behind it: the front piece's edge then blends with the floor, and its depth keeps the
 // piece behind from filling in (light dots along the edge, for as long as that order lasts).
 // So a split object pipeline's twin draws only the opaque pixels, and every such draw is
-// repeated at the end of its render pass with this pipeline for the partly covered ones, which
-// then blend over everything opaque behind them, whatever the order. They still write depth:
+// repeated at the end of its render pass with this pipeline for the partly covered ones (back
+// to front, see flush_partial), which then blend over everything opaque behind them, whatever
+// the game's order. They still write depth:
 // without it a chair behind a table, its legs' edges repeated after the table's, showed through
 // the table's edge and the flowers on it.
 std::unordered_map<uint64_t, VkPipeline> g_world_partial;  // game pipeline -> partly covered pixels' twin
@@ -1176,6 +1180,7 @@ void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
     if (kind == g_world_kind.end() || layout == g_world_layout.end()) return;
     static unsigned warned = 0;
     Deferred d;
+    d.game_pipeline = st.pipeline;
     d.pipeline = partial->second;
     d.layout = (VkPipelineLayout)layout->second;
     d.sets = kind->second == kWorldFloor ? 1 : 2;  // floors: the texture; objects: texture and depth
@@ -1228,13 +1233,61 @@ void issue_dynamic_state(VkCommandBuffer cb, const std::vector<VkViewport>& vp, 
     if (!r.empty()) real_vkCmdSetScissor(cb, 0, static_cast<uint32_t>(r.size()), r.data());
 }
 
-// The deferred draws' partly covered pixels (st.deferred or st.deferred_floor), in the game's
-// order, then the game's state as it was.
+const char* mapped_at(uint64_t buffer, VkDeviceSize off, VkDeviceSize len);
+
+// The farthest depth among a deferred object draw's vertices (vertex attribute 3: nearest and
+// farthest depth), from the game's mapped vertex buffer; false if it cannot be read.
+bool far_depth(const Deferred& d, float* out) {
+    auto pi = g_pipe_info.find(d.game_pipeline);
+    if (pi == g_pipe_info.end()) return false;
+    const VkVertexInputAttributeDescription* attr = nullptr;
+    for (auto& a : pi->second.attrs)
+        if (a.location == 3 && a.format == VK_FORMAT_R32G32_SFLOAT) attr = &a;
+    if (!attr || attr->binding >= d.vbs.size()) return false;
+    uint32_t stride = 0;
+    for (auto& b : pi->second.bindings)
+        if (b.binding == attr->binding) stride = b.stride;
+    uint32_t n = std::min(d.args.count, 64u);
+    float farthest = -1;
+    for (uint32_t k = 0; k < n; ++k) {
+        int64_t vertex = d.args.first + k;
+        if (d.args.indexed) {
+            size_t isz = d.ib_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+            const char* ip = mapped_at(d.ib, d.ib_off + (d.args.first + k) * isz, isz);
+            if (!ip) return false;
+            vertex = (isz == 4 ? *reinterpret_cast<const uint32_t*>(ip) : *reinterpret_cast<const uint16_t*>(ip)) +
+                     static_cast<int64_t>(d.args.vertex_offset);
+        }
+        const char* p = mapped_at(d.vbs[attr->binding].first, d.vbs[attr->binding].second + vertex * stride + attr->offset, 8);
+        if (!p) return false;
+        float z[2];
+        memcpy(z, p, sizeof z);
+        farthest = std::max(farthest, z[1]);
+    }
+    *out = farthest;
+    return n > 0;
+}
+
+// The deferred draws' partly covered pixels (st.deferred or st.deferred_floor), then the game's
+// state as it was. The objects' go back to front (by their farthest depth), not in the game's
+// order: two partly covered pixels over each other, of a leaf in front of an iron lattice, were
+// drawn front first now and then, the leaf's then blending with the floor (light leaf edges).
 void flush_partial(VkCommandBuffer cb, bool floors) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     CmdState& st = g_cmd[cb];
     std::vector<Deferred>& list = floors ? st.deferred_floor : st.deferred;
     if (list.empty()) return;
+    if (!floors) {
+        bool keyed = true;
+        for (auto& d : list) keyed = keyed && far_depth(d, &d.key);
+        if (keyed) {
+            std::stable_sort(list.begin(), list.end(), [](const Deferred& a, const Deferred& b) { return a.key > b.key; });
+            st.sorted.insert(st.sorted.end(), list.begin(), list.end());
+        } else {
+            static unsigned warned = 0;
+            if (warned++ < 20) logf("WARNING repeated object draws left in the game's order (vertices not readable)");
+        }
+    }
     if (g_trace) logf("    [partly covered pixels of %zu %s draws]", list.size(), floors ? "floor" : "object");
     VkPipeline pipeline = VK_NULL_HANDLE;
     const std::vector<VkViewport>* vp = &st.viewports;
@@ -2787,6 +2840,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb, const
         st.pushes.clear();
         st.deferred.clear();
         st.deferred_floor.clear();
+        st.sorted.clear();
         st.vbs.clear();
         st.ib = 0;
     }
@@ -2923,10 +2977,31 @@ void write_world_draws(VkCommandBuffer cb) {
     g_draw_recs.erase(it);
 }
 
+// The repeated object draws were sorted by vertex depths read while recording; the game might
+// write its vertices later. Read them again now, when they are final, and log any change.
+void check_sorted(VkCommandBuffer cb) {
+    auto it = g_cmd.find(cb);
+    if (it == g_cmd.end() || it->second.sorted.empty()) return;
+    static unsigned checked = 0, changed = 0, logged = 0;
+    for (auto& d : it->second.sorted) {
+        float k;
+        ++checked;
+        if (!far_depth(d, &k) || k != d.key) ++changed;
+    }
+    it->second.sorted.clear();
+    if (changed && logged < 20) {
+        ++logged;
+        logf("WARNING %u of %u repeated object draws had other vertex depths at submit", changed, checked);
+        changed = 0;
+    }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
     wait_files();  // the staging buffers the submitted uploads copy from are filled
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
+        for (uint32_t i = 0; i < n; ++i)
+            for (uint32_t k = 0; k < s[i].commandBufferCount; ++k) check_sorted(s[i].pCommandBuffers[k]);
         if (!g_draw_recs.empty())
             for (uint32_t i = 0; i < n; ++i)
                 for (uint32_t k = 0; k < s[i].commandBufferCount; ++k) write_world_draws(s[i].pCommandBuffers[k]);

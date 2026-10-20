@@ -49,8 +49,8 @@ instead of the system loader. It forwards every call to the real loader
   between floors and along wall tops. Ours sample floors on the exact texel lattice and
   every sprite a tenth of a pixel right of and below the pixel centre. The object twins
   draw only opaque pixels; each such draw is repeated just before `vkCmdEndRenderPass`
-  for the partly covered edge pixels (in the game's order, still writing depth), then
-  the game's state is restored. The game's object order changes from frame to frame and sometimes puts a
+  for the partly covered edge pixels (back to front by their vertices' farthest depth,
+  still writing depth), then the game's state is restored. The game's object order changes from frame to frame and sometimes puts a
   piece in front before the one behind it, and an edge pixel drawn then blended with
   the floor and kept the piece behind out (light dots along the edge). Floor tiles are
   split the same way (`tools/hd_floors.py` adds the partly covered pixels of their

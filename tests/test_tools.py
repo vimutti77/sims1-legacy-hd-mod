@@ -18,7 +18,13 @@ import font_atlas  # noqa: E402
 import iff  # noqa: E402
 import hd_art  # noqa: E402
 import hd_composite  # noqa: E402
+import hd_pack  # noqa: E402
+import hd_shapes  # noqa: E402
+import hd_ui  # noqa: E402
+import stairs  # noqa: E402
+import hd_walls  # noqa: E402
 import inventory  # noqa: E402
+import spr1  # noqa: E402
 import spr2  # noqa: E402
 
 
@@ -375,6 +381,269 @@ class HdArtTests(unittest.TestCase):
         # grown below the original: nearer the lower it is, as the ground it stands on
         twin = hd_art.depth_twin(1, 2, bytes([1, 0]), bytes([20, 0]))
         self.assertEqual([twin[y * 3] for y in range(6)], [19, 19, 19, 18, 18, 17])
+
+
+def make_spr1(frames: list[bytes], palette: int = spr1.NO_PALETTE) -> bytes:
+    """SPR# chunk body: version 504, the frames' offsets, the frames."""
+    head = struct.pack("<III", 504, len(frames), palette)
+    pos = len(head) + 4 * len(frames)
+    offsets = []
+    for f in frames:
+        offsets.append(pos)
+        pos += len(f)
+    return head + struct.pack(f"<{len(frames)}I", *offsets) + b"".join(frames)
+
+
+class Spr1Tests(unittest.TestCase):
+    # a 5x3 frame: row 0 skips 1 then fills 2 with index 7; row 1 is skipped; row 2 has
+    # 3 literal indexes (padded to even), then ends
+    FRAME = (struct.pack("<IHH", 0, 3, 5)
+             + bytes([0x04, 2 + 2 + 2 + 2 + 2, 0x01, 1, 0x02, 2, 7, 0, 0x05, 0])
+             + bytes([0x09, 1])
+             + bytes([0x04, 2 + 2 + 4 + 2, 0x03, 3, 1, 2, 3, 0, 0x05, 0])
+             + bytes([0x05, 0]))
+
+    def test_decodes_rows_skips_and_runs(self):
+        palette, offsets = spr1.frame_offsets(make_spr1([self.FRAME]))
+        self.assertEqual(palette, spr1.NO_PALETTE)
+        f = spr1.decode_frame(make_spr1([self.FRAME]), offsets[0])
+        self.assertEqual((f.w, f.h), (5, 3))
+        self.assertEqual(f.pixels, [None, 7, 7, None, None] + [None] * 5 + [1, 2, 3, None, None])
+
+    def test_game_texture_is_rgb565_and_opaque(self):
+        f = spr1.Frame(2, 1, [3, None])
+        pal = [(0, 0, 0)] * 3 + [(0xFF, 0x87, 0x13)]
+        self.assertEqual(spr1.game_texture(f, pal), bytes([0x10, 0x84, 0xF8, 255, 0, 0, 0, 0]))
+
+    def test_wallpaper_palettes(self):
+        pals = {1536 + 21: ["wallpaper 21"], 9: ["own"]}
+        paper = iff.IffChunk("SPR#", 1066, 0, "21:3(2069)", 0, 0)
+        style = iff.IffChunk("SPR#", 1066, 0, "21:3:0(1066)", 0, 0)
+        self.assertEqual(spr1.chunk_palette("walls.iff", paper, spr1.NO_PALETTE, pals), ["wallpaper 21"])
+        self.assertIsNone(spr1.chunk_palette("walls.iff", style, spr1.NO_PALETTE, pals))  # wall styles: none
+        self.assertEqual(spr1.chunk_palette("Brick.wll", paper, 9, pals), ["own"])
+
+    def test_frames_of_a_file(self):
+        data = make_iff([("PALT", 1557, "", struct.pack("<IIII", 0, 8, 0, 0) + bytes(range(24))),
+                         ("SPR#", 1066, "21:3(2069)", make_spr1([self.FRAME]))])
+        [(c, i, f, pal)] = list(spr1.frames("walls.iff", data))
+        self.assertEqual((c.id, i, f.w, f.h, len(pal)), (1066, 0, 5, 3, 8))
+
+    def test_rejects_broken_data(self):
+        with self.assertRaises(spr1.Spr1Error):
+            spr1.frame_offsets(make_spr1([self.FRAME])[:14])
+        with self.assertRaises(spr1.Spr1Error):  # a run longer than its row
+            spr1.decode_frame(struct.pack("<IHH", 0, 1, 4) + bytes([0x04, 6, 0x03, 9, 1, 2]), 0)
+        with self.assertRaises(spr1.Spr1Error):
+            spr1.decode_frame(struct.pack("<IHH", 0, 1, 4) + bytes([0x07, 0]), 0)
+
+
+class HdWallsTests(unittest.TestCase):
+    def test_covered_hash_is_the_content_hash_of_the_covered_pixels(self):
+        bgra = bytes(range(4 * 6))
+        self.assertEqual("3x2_" + hd_walls.covered_hash(3, 2, bgra, bytes([1] * 6)),
+                         spr2.content_name(3, 2, bgra))
+        # pixels outside the mask (the corners the game fills) do not count
+        other = bytearray(bgra)
+        other[0:4] = b"\xff\xff\xff\xff"
+        mask = bytes([0, 1, 1, 1, 1, 1])
+        self.assertEqual(hd_walls.covered_hash(3, 2, bgra, mask), hd_walls.covered_hash(3, 2, bytes(other), mask))
+
+    def test_a_wall_face_between_its_neighbours(self):
+        # 4x4 face rising to the right: column x covers rows 2 - x // 2 .. 3 - x // 2 (+ 1)
+        w = h = 4
+        mask = bytearray(w * h)
+        for x in range(w):
+            for y in range(2 - x // 2, 4 - x // 2):
+                mask[y * w + x] = 1
+        self.assertGreater(hd_walls.slope(w, h, bytes(mask)), 0)
+        bgra = bytearray(w * h * 4)
+        for i in range(w * h):
+            if mask[i]:
+                bgra[i * 4:i * 4 + 4] = bytes((0, 0, i, 255))  # B, G, R, A
+        cw, ch, rgba = hd_walls.wall_input(w, h, bytes(bgra), bytes(mask))
+        self.assertEqual((cw, ch), (12, 8))
+
+        def red(x, y):
+            return rgba[(y * cw + x) * 4]
+
+        # the frame sits at (w, w/2); its right neighbour w to the right and w/2 higher
+        self.assertEqual(red(4 + 0, 2 + 2), 2 * w + 0)          # frame pixel (0, 2)
+        self.assertEqual(red(8 + 0, 2 + 2 - 2), 2 * w + 0)      # the same pixel of the right neighbour
+        self.assertEqual(red(0 + 3, 2 + 1 + 2), 1 * w + 3)      # pixel (3, 1) of the left neighbour
+
+    def test_masks_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "2x1.wallmasks"
+            hd_walls.write_masks(p, 2, 1, [b"\x01\x00", b"\x01\x01"])
+            self.assertEqual(p.read_bytes(), b"WMSK" + struct.pack("<III", 2, 1, 2) + b"\x01\x00\x01\x01")
+
+
+class HdShapesTests(unittest.TestCase):
+    LINES = [(-0.5, 8.0), (0.5, -9.0), (0.5, 9.5), (-0.5, 26.0), (-0.5, 10.0), (0.5, -7.0), (0.5, 7.0), (-0.5, 24.0)]
+
+    def band(self, w=34, h=18):
+        tex = bytearray(w * h * 4)
+        for y in range(h):
+            for x in range(w):
+                if hd_shapes.inside(self.LINES, x + 0.5, y + 0.5):
+                    tex[(y * w + x) * 4:(y * w + x) * 4 + 4] = bytes((0, 252, 248, 255))
+        return bytes(tex)
+
+    def test_fitted_lines_give_the_sprite_back(self):
+        tex = self.band()
+        mask = hd_shapes.mask_of(tex, 34, 18)
+        lines = hd_shapes.fit_band(mask)
+        self.assertTrue(all(hd_shapes.inside(lines, x + 0.5, y + 0.5) == mask[y][x]
+                            for y in range(18) for x in range(34)))
+
+    def test_redraw_is_smooth_and_premultiplied(self):
+        hd = hd_shapes.redraw(self.band(), 34, 18)
+        self.assertEqual(len(hd), 34 * 3 * 18 * 3 * 4)
+        alphas = set(hd[3::4])
+        self.assertIn(255, alphas)
+        self.assertTrue(any(0 < a < 255 for a in alphas))  # anti-aliased edges
+        for i in range(0, len(hd), 4):
+            self.assertLessEqual(hd[i + 1], hd[i + 3])  # colour never above alpha
+
+    def test_rejects_other_shapes(self):
+        tex = bytearray(self.band())
+        tex[(9 * 34 + 17) * 4 + 3] = 255  # a pixel in the hole
+        with self.assertRaises(hd_shapes.ShapeError):
+            hd_shapes.redraw(bytes(tex), 34, 18)
+
+
+class StairsTests(unittest.TestCase):
+    W, H = 40, 24
+
+    def strip(self):
+        """A strip between two lines of slope 1/2, ended by a vertical cut: as a 1x sprite."""
+        return bytes(1 if x + 0.5 < 30 and 0.5 * (x + 0.5) <= y + 0.5 <= 0.5 * (x + 0.5) + 6 else 0
+                     for y in range(self.H) for x in range(self.W))
+
+    def test_edges_become_straight_and_soft(self):
+        m = self.strip()
+        cov = stairs.upscale(m, self.W, self.H)
+        W3 = self.W * 3
+        self.assertEqual(len(cov), W3 * self.H * 3)
+        self.assertTrue(any(0 < v < 255 for v in cov))  # anti-aliased edges
+        # along the lower edge (inside above it) the coverage of each column falls once, smoothly
+        x = 45  # a 3x column well inside the strip's length
+        col = [cov[y * W3 + x] for y in range(self.H * 3)]
+        rises = sum(1 for a, b in zip(col, col[1:]) if b > a)
+        falls = sum(1 for a, b in zip(col, col[1:]) if b < a)
+        self.assertLessEqual(rises, 2)
+        self.assertLessEqual(falls, 2)
+        # a straight edge: where coverage crosses half, one row per two 3x columns (slope 1/2)
+        def half(xx):
+            c = [cov[y * W3 + xx] for y in range(self.H * 3)]
+            return max(y for y in range(self.H * 3) if c[y] >= 128)
+        steps = [half(xx + 2) - half(xx) for xx in range(30, 60, 2)]
+        self.assertTrue(all(s == 1 for s in steps), steps)
+
+    def test_a_grown_wall_face_is_solid_under_the_wall_tops_soft_edge(self):
+        face = bytes(1 if y + 0.5 >= 4 + 0.5 * (x + 0.5) else 0 for y in range(self.H) for x in range(self.W))
+        top = bytes(1 - v for v in face)
+        f, t = stairs.upscale(face, self.W, self.H, grow_top=0.4), stairs.upscale(top, self.W, self.H)
+        soft = [i for i, v in enumerate(t) if 0 < v < 255]
+        self.assertTrue(soft)
+        self.assertTrue(all(f[i] == 255 for i in soft))
+        self.assertTrue(all(f[i] > 0 or t[i] == 255 for i in range(len(f))))  # nothing open between them
+
+    def test_marked_coverage_tells_added_pixels_apart(self):
+        m = self.strip()
+        plain, marked = stairs.upscale(m, self.W, self.H), stairs.upscale(m, self.W, self.H, marked=True)
+        W3 = self.W * 3
+        for i, (c, v) in enumerate(zip(plain, marked)):
+            original = m[(i // W3 // 3) * self.W + (i % W3) // 3]
+            self.assertEqual(v >= 128, bool(original))
+            self.assertLessEqual(abs((v - 128 if original else v) * 255 / 127 - c), 2)
+        self.assertEqual(stairs.mark(255, True), 255)
+        self.assertEqual(stairs.mark(0, False), 0)
+
+    def test_both_sides_of_an_edge_still_meet(self):
+        m = self.strip()
+        inv = bytes(1 - v for v in m)
+        a, b = stairs.upscale(m, self.W, self.H), stairs.upscale(inv, self.W, self.H)
+        self.assertTrue(all(abs(x + y - 255) <= 16 for x, y in zip(a, b)))
+
+
+class HdUiTests(unittest.TestCase):
+    def test_upload_is_rgb565_truncated(self):
+        self.assertEqual(hd_ui.upload(bytes((115, 49, 255, 255))), bytes((0xF8, 0x30, 0x70, 255)))
+
+    def test_dithered_gradient_becomes_smooth_and_keeps_its_line(self):
+        w, h = 60, 8
+        tex = bytearray()
+        for y in range(h):
+            for x in range(w):
+                if y == 1:  # a bevel line, 16 brighter
+                    v = 160
+                else:  # a gradient 144 -> 96 along x, dithered in steps of 8
+                    v = 144 - 48 * x // w
+                    v = v // 8 * 8 + (8 if (x * 7 + y * 3) % 5 < (v % 8) * 5 // 8 else 0)
+                tex += bytes((v, v, v, 255))
+        hd = hd_ui.smooth_gradient(w, h, bytes(tex))
+        W = w * 3
+        self.assertEqual(len(hd), W * h * 3 * 4)
+        row = [hd[(4 * 3 * W + X) * 4] for X in range(W)]  # a row in the middle
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(row, row[1:])), 2)  # no dither steps left
+        self.assertGreater(row[0], row[-1])
+        line = [hd[(1 * 3 * W + X) * 4] for X in range(W)]
+        self.assertTrue(all(v == 160 for v in line))  # the line is not blurred into its neighbours
+
+
+class HdPackTests(unittest.TestCase):
+    A, B, C = "2x2_00000000000000aa@3.bgra", "2x2_00000000000000bb_f9@3.raw", "2x2_00000000000000cc_w3@3.bgra"
+
+    def test_pack_read_and_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            inst = hd_pack.Installed(Path(d))
+            inst.write(self.A, b"a" * 36)
+            inst.write(self.B, b"b" * 9)
+            (Path(d) / "8x8@3.bgra").write_bytes(b"font")  # not content: stays loose
+            self.assertEqual(inst.pack(log=lambda s: None), 2)
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["8x8@3.bgra", "hd_0000.pack"])
+            again = hd_pack.Installed(Path(d))
+            self.assertEqual(again.read(self.A), b"a" * 36)
+            self.assertEqual(again.read(self.B), b"b" * 9)
+            self.assertEqual(again.size(self.B), 9)
+            again.write(self.A, b"A" * 36)  # loose wins over the pack
+            self.assertEqual(again.read(self.A), b"A" * 36)
+            again.write(self.C, b"c" * 36)
+            again.pack(log=lambda s: None)  # a later pack wins over an earlier one
+            last = hd_pack.Installed(Path(d))
+            self.assertEqual([p.name for p in last.packs()], ["hd_0000.pack", "hd_0001.pack"])
+            self.assertEqual(last.read(self.A), b"A" * 36)
+            self.assertEqual(last.compact(log=lambda s: None), 1)
+            self.assertEqual(hd_pack.Installed(Path(d)).read(self.A), b"A" * 36)
+
+    def test_remove_and_backup(self):
+        with tempfile.TemporaryDirectory() as d:
+            inst = hd_pack.Installed(Path(d) / "replace")
+            inst.write(self.A, b"a" * 36)
+            inst.write(self.C, b"c" * 36)
+            inst.pack(backup=Path(d) / "loose", log=lambda s: None)
+            self.assertEqual((Path(d) / "loose" / self.A).read_bytes(), b"a" * 36)
+            inst.write(self.A, b"A" * 36)
+            inst.pack(log=lambda s: None)  # now in both packs
+            self.assertEqual(inst.remove([self.A]), 1)
+            self.assertNotIn(self.A, hd_pack.Installed(Path(d) / "replace"))
+            self.assertEqual(hd_pack.Installed(Path(d) / "replace").read(self.C), b"c" * 36)
+            self.assertEqual(inst.remove([self.C]), 1)
+            self.assertEqual(list((Path(d) / "replace").iterdir()), [])  # empty packs go
+
+    def test_rejects_bad_packs(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "hd_0000.pack"
+            p.write_bytes(b"x" * 40)
+            with self.assertRaises(ValueError):
+                hd_pack.read_index(p)
+            raw = b"..\\evil@3.bgra"
+            p.write_bytes(b"data" + struct.pack("<H", len(raw)) + raw + struct.pack("<QId", 0, 4, 0)
+                          + hd_pack.FOOTER.pack(1, 4, hd_pack.MAGIC, hd_pack.VERSION))
+            with self.assertRaises(ValueError):
+                hd_pack.read_index(p)
 
 
 class FarTests(unittest.TestCase):

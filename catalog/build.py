@@ -53,7 +53,6 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):  # one
 
 import argparse  # noqa: E402
 import copy  # noqa: E402
-import shutil  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
 from concurrent.futures import ProcessPoolExecutor  # noqa: E402
@@ -67,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import assemble  # noqa: E402
 import fit  # noqa: E402
 import hd_art  # noqa: E402
+import hd_pack  # noqa: E402
 import iff  # noqa: E402
 import objects  # noqa: E402
 import spr2  # noqa: E402
@@ -328,24 +328,21 @@ def install(work: Path, game: Path, rows) -> None:
     for pic in read_list(work / "ai.txt"):  # painted icons upscaled by the AI (ai_pictures.py)
         if pic not in sources and pic not in rejected:
             sources[pic] = work / "ai" / f"{pic}@3.bgra"
-    dest = game / "vkproxy" / "replace"
-    dest.mkdir(parents=True, exist_ok=True)
-    copied = removed = 0
+    dest = hd_pack.Installed(game / "vkproxy" / "replace")
+    copied = 0
     for pic, src in sorted(sources.items()):
-        dst = dest / f"{pic}@3.bgra"
         if not src.exists():
             continue
-        if not dst.exists() or dst.read_bytes() != src.read_bytes():
-            shutil.copyfile(src, dst)
+        data = src.read_bytes()
+        if dest.read(f"{pic}@3.bgra") != data:
+            dest.write(f"{pic}@3.bgra", data)
             copied += 1
-    for pic in read_list(work / "installed.txt") - set(sources):
-        if (dest / f"{pic}@3.bgra").exists():
-            (dest / f"{pic}@3.bgra").unlink()
-            removed += 1
-    installed = sorted(p for p in sources if (dest / f"{p}@3.bgra").exists())
+    removed = dest.remove(f"{pic}@3.bgra" for pic in read_list(work / "installed.txt") - set(sources))
+    hd_pack.finish_install(dest, log=lambda s: None)  # loose files into a pack: first opens are slow in game
+    installed = sorted(p for p in sources if f"{p}@3.bgra" in dest)
     (work / "installed.txt").write_text("\n".join(installed) + "\n")
     print(f"installed {len(installed)} catalogue pictures ({copied} new or changed, {removed} taken out) "
-          f"into {dest}; restart the game to see them")
+          f"into {dest.folder}; restart the game to see them")
 
 
 def main(argv: list[str]) -> int:

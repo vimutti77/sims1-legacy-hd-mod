@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import shutil
 import struct
 import subprocess
 import sys
@@ -52,6 +51,7 @@ from pathlib import Path
 
 import far
 import hd_composite
+import hd_pack
 import iff
 import spr2
 
@@ -271,7 +271,7 @@ def find_depths(game: Path, names: set, cache: Path) -> dict:
     return out
 
 
-def install_edit(name: str, built: Path, edit: Path, dest: Path, depths) -> str:
+def install_edit(name: str, built: Path, edit: Path, dest: hd_pack.Installed, depths) -> str:
     """Install one touched-up texture and, when its coverage grew, its depth twin; returns
     what was done. depths(name) gives find_depths' entry for the name."""
     w, h = hd_composite.size_of(name)
@@ -280,8 +280,8 @@ def install_edit(name: str, built: Path, edit: Path, dest: Path, depths) -> str:
     if grown:
         fw, fh, covered, depth = depths(name)
         dname = spr2.content_name(fw, fh, depth) + "_f9"
-        (dest / f"{dname}@{s}.raw").write_bytes(depth_twin(fw, fh, covered, depth))
-    (dest / f"{name}@{s}.bgra").write_bytes(tex)
+        dest.write(f"{dname}@{s}.raw", depth_twin(fw, fh, covered, depth))
+    dest.write(f"{name}@{s}.bgra", tex)
     return "grown, with a depth twin" if grown else "colour"
 
 
@@ -329,7 +329,7 @@ def main(argv: list[str]) -> int:
         return find_depths(args.game, {name}, args.work / "depth")[name]
 
     if args.install_edits:
-        dest = args.game / "vkproxy" / "replace"
+        dest = hd_pack.Installed(args.game / "vkproxy" / "replace")
         n = 0
         for edit in sorted(edits.glob("*.png")):
             src = hd / f"{edit.stem}@3.bgra"
@@ -343,7 +343,8 @@ def main(argv: list[str]) -> int:
                 continue
             print(f"{edit.stem}: {done}")
             n += 1
-        print(f"installed {n} touched-up textures into {dest} (restart the game to load them)")
+        hd_pack.finish_install(dest)
+        print(f"installed {n} touched-up textures into {dest.folder} (restart the game to load them)")
         return 0
     if args.export_edit:
         edits.mkdir(parents=True, exist_ok=True)
@@ -432,22 +433,23 @@ def main(argv: list[str]) -> int:
 
     # 4. install (files that are new or rebuilt since the last install)
     if args.install:
-        dest = args.game / "vkproxy" / "replace"
-        dest.mkdir(parents=True, exist_ok=True)
+        dest = hd_pack.Installed(args.game / "vkproxy" / "replace")
         n = 0
         for name in names:
-            src, dst, edit = hd / f"{name}@3.bgra", dest / f"{name}@3.bgra", edits / f"{name}.png"
+            src, edit = hd / f"{name}@3.bgra", edits / f"{name}.png"
             newest = max((p.stat().st_mtime for p in (src, edit) if p.exists()), default=None)
-            if newest is None or (dst.exists() and dst.stat().st_mtime >= newest):
+            installed = dest.mtime(f"{name}@3.bgra")
+            if newest is None or (installed is not None and installed >= newest):
                 continue
             if edit.exists() and src.exists():  # touched up by hand
                 install_edit(name, src, edit, dest, depths)
             elif src.exists():
-                shutil.copyfile(src, dst)
+                dest.copy(src, f"{name}@3.bgra")
             else:
                 continue
             n += 1
-        print(f"installed {n} HD textures into {dest} ({lap()}; restart the game to load them)")
+        hd_pack.finish_install(dest)  # loose files into a pack: first opens are slow in game
+        print(f"installed {n} HD textures into {dest.folder} ({lap()}; restart the game to load them)")
     return 0
 
 

@@ -32,16 +32,20 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -51,6 +55,34 @@ const uint32_t kXbrFrag[] =
     ;
 // The game's textured-quad fragment shader: out = vertex colour * texture(binding 0).
 const char* const kQuadFragShader = "shader_466f913aec289dea.spv";
+
+// The in-lot sprite shaders, replaced by copies that sample on the exact texel lattice with
+// one tie-break for all sprites (src/world_*.frag): at the middle zoom the game's own leave
+// light dots along the line between floors and along wall tops.
+const uint32_t kWorldFloorFrag[] =
+#include "world_floor_frag.inc"
+    ;
+const uint32_t kWorldWallFrag[] =
+#include "world_wall_frag.inc"
+    ;
+const uint32_t kWorldObjectFrag[] =
+#include "world_object_frag.inc"
+    ;
+const uint32_t kWorldObjectYiqFrag[] =
+#include "world_object_yiq_frag.inc"
+    ;
+struct WorldShader {
+    const char* game;  // the game's fragment shader it replaces
+    const uint32_t* code;
+    size_t size;
+    bool split;  // drawn in two parts: opaque pixels, then the partly covered ones (g_world_partial)
+};
+const WorldShader kWorldShaders[] = {
+    {"shader_63b9db14d8318909.spv", kWorldFloorFrag, sizeof kWorldFloorFrag, false},         // floors, wall tops
+    {"shader_dfa0d8fccf7ee369.spv", kWorldWallFrag, sizeof kWorldWallFrag, false},           // walls
+    {"shader_b2e55b6e3b04a39c.spv", kWorldObjectFrag, sizeof kWorldObjectFrag, true},        // objects
+    {"shader_c616498e50bad3d1.spv", kWorldObjectYiqFrag, sizeof kWorldObjectYiqFrag, true},  // objects, brightened
+};
 
 std::recursive_mutex g_mu;
 FILE* g_log = nullptr;
@@ -62,8 +94,11 @@ PFN_vkCreateInstance real_CreateInstance = nullptr;
 PFN_vkCreateDevice real_CreateDevice = nullptr;
 unsigned g_frame = 0;
 bool g_trace = false;  // log draws until the next present
+unsigned g_trace_left = 0;  // frames still to trace (F11: kTraceFrames)
+const unsigned kTraceFrames = 90;  // ~1.5 s: time to press F11 and then do what is to be traced
 bool g_xbr_on = true;
 bool g_hd_on = true;  // F9 / hd.toggle: draw with HD twins (content replacement)
+bool g_world_on = true;  // F6 / world.toggle, VKPROXY_WORLDFIX=0: the world shader twins (kWorldShaders)
 unsigned g_xbr_draws = 0;  // substituted draws in the current frame
 // Layer enlargement (step 1b): render targets smaller than the swapchain are
 // created g_layer_scale times larger, and passes into them are scaled to match,
@@ -78,10 +113,12 @@ bool g_dump = false;  // VKPROXY_DUMP=1: save texture uploads (see dump_upload)
 bool g_replace_on = true;  // VKPROXY_REPLACE=0 disables texture replacement
 bool g_xbr_all = true;     // VKPROXY_XBR_ALL=0: xBR only on layer composites (see xbr_twin_for)
 // World draw log (VKPROXY_WORLDLOG=1): every texture upload is named by its content
-// hash, and F8 / world.now writes the next frame's draws with their textures, push
+// hash, and F8 / world.now writes the next kWorldFrames frames' draws with their textures, push
 // constants and vertices to <VKPROXY_DIR>\world.log (how the game assembles sprites).
 bool g_names_on = false;
 bool g_world_now = false;
+unsigned g_world_left = 0;          // frames still to log
+const unsigned kWorldFrames = 60;   // F8 logs this many frames (~1 s): time to make a passing effect happen
 // Texture replacement (step 2): a sampled B8G8R8A8 image of w x h is created
 // g_layer_scale times larger when <g_replace_dir>\<w>x<h>@<scale>.bgra exists,
 // and every upload into it is replaced by that file's pixels.
@@ -98,7 +135,8 @@ struct Replacement {
 // (the game recreates its font atlases often).
 struct Staging {
     VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;  // none for a range of the ring (twin_staging)
+    VkDeviceSize offset = 0;
 };
 VkShaderModule g_xbr_module = VK_NULL_HANDLE;
 // Time the proxy spends on texture uploads, per frame: logged ("perf:") for every frame
@@ -187,6 +225,7 @@ void init() {
         CreateDirectoryA(g_dir.c_str(), nullptr);
         g_log = fopen((g_dir + "\\vkproxy.log").c_str(), "w");
         if (GetEnvironmentVariableA("VKPROXY_XBR", buf, MAX_PATH) && buf[0] == '0') g_xbr_on = false;
+        if (GetEnvironmentVariableA("VKPROXY_WORLDFIX", buf, MAX_PATH) && buf[0] == '0') g_world_on = false;
         if (GetEnvironmentVariableA("VKPROXY_LAYER_SCALE", buf, MAX_PATH)) {
             g_layer_scale = std::min(std::max(atoi(buf), 1), 4);
             g_layer_scale_auto = false;
@@ -228,8 +267,44 @@ struct Binding {
     uint64_t view;
     uint64_t sampler;
 };
+// One vkCmdBindDescriptorSets / vkCmdPushConstants as the game issued it (to issue again).
+struct SetCall {
+    uint64_t layout = 0;
+    uint32_t first = 0;
+    std::vector<uint64_t> sets;
+    std::vector<uint32_t> dyn;
+    unsigned seq = 0;
+};
+struct PushRec {
+    uint64_t layout = 0;
+    VkShaderStageFlags stages = 0;
+    uint32_t offset = 0, size = 0;
+    unsigned char bytes[128] = {};
+    unsigned seq = 0;
+};
+struct DrawArgs {
+    bool indexed = false;
+    uint32_t count = 0, instances = 0, first = 0;
+    int32_t vertex_offset = 0;
+    uint32_t first_instance = 0;
+};
+// An object draw's partly covered pixels, drawn again at the end of the pass (see g_world_partial).
+struct Deferred {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout[2] = {};
+    VkDescriptorSet set[2] = {};
+    std::vector<PushRec> pushes;
+    std::vector<std::pair<uint64_t, VkDeviceSize>> vbs;
+    uint64_t ib = 0;
+    VkDeviceSize ib_off = 0;
+    VkIndexType ib_type = VK_INDEX_TYPE_UINT16;
+    DrawArgs args;
+    std::vector<VkViewport> viewports;
+    std::vector<VkRect2D> scissors;
+};
 struct CmdState {
     uint64_t pipeline = 0;
+    uint64_t bound = 0;  // what is really bound: the game's pipeline or a twin of it
     std::vector<uint64_t> sets;
     uint32_t rp_w = 0, rp_h = 0;
     std::vector<uint64_t> targets;  // views being rendered to
@@ -245,6 +320,12 @@ struct CmdState {
     VkIndexType ib_type = VK_INDEX_TYPE_UINT16;
     unsigned char pc[128] = {};  // push constant bytes as last pushed
     uint32_t pc_size = 0;
+    // to draw again at the end of a render pass and then restore the game's state
+    bool in_pass = false;  // inside vkCmdBeginRenderPass .. vkCmdEndRenderPass
+    unsigned seq = 0;
+    std::vector<std::shared_ptr<SetCall>> set_calls;  // per set index: the call that last bound it
+    std::vector<PushRec> pushes;                      // the last push for each set of stages
+    std::vector<Deferred> deferred;
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -255,6 +336,17 @@ std::unordered_map<uint64_t, std::vector<Binding>> g_sets;  // VkDescriptorSet
 std::unordered_map<uint64_t, std::string> g_modules;        // VkShaderModule -> spv file
 std::unordered_map<uint64_t, unsigned> g_pipelines;         // VkPipeline -> id
 std::unordered_map<uint64_t, VkPipeline> g_xbr_twin;        // game pipeline -> xBR twin
+std::unordered_map<uint64_t, VkPipeline> g_world_twin;      // game pipeline -> twin with a world shader
+// Object sprites have partly covered pixels along their edges (more in HD than in the game's
+// own art), blended over what is already drawn, and they write depth. The game draws objects
+// in an order that can change from frame to frame and sometimes draws a piece in front before
+// the one behind it: the front piece's edge then blends with the floor, and its depth keeps the
+// piece behind from filling in (light dots along the edge, for as long as that order lasts).
+// So a split object pipeline's twin draws only the opaque pixels, and every such draw is
+// repeated at the end of its render pass with this pipeline (no depth writes) for the partly
+// covered ones, which then blend over everything opaque behind them, whatever the order.
+std::unordered_map<uint64_t, VkPipeline> g_world_partial;  // game pipeline -> partly covered pixels' twin
+VkShaderModule g_world_modules[std::size(kWorldShaders)] = {};
 std::unordered_map<VkCommandBuffer, CmdState> g_cmd;
 std::unordered_map<uint64_t, Replacement> g_replace;        // VkImage -> replacement pixels
 std::unordered_map<std::string, Staging> g_staging;         // replacement file -> staging buffer
@@ -272,11 +364,17 @@ std::map<std::tuple<uint32_t, uint32_t, VkFormat>, Readback> g_readback;
 // draws that sample the texture bind a descriptor set pointing at the twin.
 // The game's own image is left alone; textures without a file keep xBR.
 struct HdImage {
+    // kWall: an HD wallpaper over the game's upload (see g_wall_masks); kWallMask: a wall's
+    // coverage mask (R8, set 1 of the wall pipeline) magnified, which a wall twin needs.
+    enum Kind : unsigned char { kFile, kWall, kWallMask };
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;  // its own; none when in a block (see g_blocks)
     VkImageView view = VK_NULL_HANDLE;
     std::string name;
     VkDeviceSize bytes = 0;
+    Kind kind = kFile;
+    int block = -1;           // the block holding it, or -1
+    VkDeviceSize offset = 0;  // its range there
 };
 std::unordered_map<uint64_t, HdImage> g_hd;               // game VkImage -> the HD twin it shows
 // HD twins by content name. The game destroys a camera view's sprites when the camera
@@ -295,8 +393,27 @@ VkDeviceSize g_idle_bytes = 0;
 VkDeviceSize g_twin_budget = 512ull << 20;  // set from the GPU's memory in hk_vkCreateDevice
 unsigned g_idle_count = 0, g_idle_max = 2048;
 std::set<std::string> g_hd_names;                          // "<w>x<h>_<hash>" with a file
+// Packs (tools/hd_pack.py): the content replacements in a few big files, opened while the
+// game loads, so a file is one read at an offset instead of an open (~5 ms the first time:
+// the antivirus scans it). Loose files win over packed ones.
+struct Packed {
+    HANDLE file;
+    uint64_t offset;
+    uint32_t size;
+};
+std::unordered_map<std::string, Packed> g_packed;  // "<name>@<scale>.<ext>" -> where
+std::vector<HANDLE> g_pack_files;
 std::set<std::pair<uint32_t, uint32_t>> g_hd_sizes;        // sizes worth hashing
 std::set<std::pair<uint32_t, uint32_t>> g_z_sizes;         // the same for depth textures (R8)
+// Walls: the game uploads an in-lot wall as its wallpaper frame with the empty corners filled
+// (the wall top in one colour, the bottom row repeated down), so only the pixels the frame
+// covers identify the wallpaper. <replace>\<w>x<h>.wallmasks holds the coverage masks of the
+// wallpaper frames of that size (tools/hd_walls.py), most used first; the HD wallpaper is
+// <w>x<h>_<hash of the covered pixels>_w<mask>@<scale>.bgra, drawn over the upload's corners.
+// A mask is kept as its runs of covered pixels (first pixel, count), in row order.
+using WallMask = std::vector<std::pair<uint32_t, uint32_t>>;
+std::map<std::pair<uint32_t, uint32_t>, std::vector<WallMask>> g_wall_masks;
+std::unordered_set<std::string> g_no_wallpaper;  // wall uploads no mask finds a file for (fences, ...)
 bool g_hd_scanned = false;
 std::unordered_map<uint64_t, bool> g_dsl_single;           // VkDescriptorSetLayout -> only binding 0, one sampler
 std::unordered_map<uint64_t, uint64_t> g_set_layout;       // VkDescriptorSet -> its layout
@@ -393,6 +510,8 @@ const char* filter_name(VkFilter f) { return f == VK_FILTER_NEAREST ? "nearest" 
     X(vkCmdBlitImage)                                                                          \
     X(vkCmdCopyImageToBuffer)                                                                  \
     X(vkCmdCopyBufferToImage)                                                                  \
+    X(vkBeginCommandBuffer)                                                                    \
+    X(vkCmdNextSubpass)                                                                        \
     X(vkCmdEndRenderPass)                                                                      \
     X(vkQueueSubmit)                                                                           \
     X(vkBindBufferMemory)                                                                      \
@@ -592,26 +711,37 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateShaderModule(VkDevice d, const VkShade
     return r;
 }
 
-// Create a copy of a game pipeline whose fragment stage is xbr.frag.
-VkPipeline make_xbr_twin(VkDevice d, VkPipelineCache c, const VkGraphicsPipelineCreateInfo& src) {
-    if (!g_xbr_module) {
-        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        mi.codeSize = sizeof kXbrFrag;
-        mi.pCode = kXbrFrag;
-        if (real_vkCreateShaderModule(d, &mi, nullptr, &g_xbr_module) != VK_SUCCESS) {
-            logf("xbr: shader module creation failed");
-            return VK_NULL_HANDLE;
-        }
-    }
+// A shader module of ours, made once (*module); false if it cannot be.
+bool own_module(VkDevice d, const uint32_t* code, size_t size, VkShaderModule* module) {
+    if (*module) return true;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = size;
+    mi.pCode = code;
+    if (real_vkCreateShaderModule(d, &mi, nullptr, module) == VK_SUCCESS) return true;
+    *module = VK_NULL_HANDLE;
+    return false;
+}
+
+// Create a copy of a game pipeline whose fragment stage is `fs` instead (specialised with
+// `spec`), optionally without depth writes.
+VkPipeline make_twin(VkDevice d, VkPipelineCache c, const VkGraphicsPipelineCreateInfo& src, VkShaderModule fs,
+                     const VkSpecializationInfo* spec = nullptr, bool no_depth_write = false) {
     std::vector<VkPipelineShaderStageCreateInfo> stages(src.pStages, src.pStages + src.stageCount);
     for (auto& s : stages)
         if (s.stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
-            s.module = g_xbr_module;
+            s.module = fs;
             s.pName = "main";
-            s.pSpecializationInfo = nullptr;
+            s.pSpecializationInfo = spec;
         }
     VkGraphicsPipelineCreateInfo ci = src;
     ci.pStages = stages.data();
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    if (no_depth_write) {
+        if (!src.pDepthStencilState) return VK_NULL_HANDLE;
+        ds = *src.pDepthStencilState;
+        ds.depthWriteEnable = VK_FALSE;
+        ci.pDepthStencilState = &ds;
+    }
     ci.flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
     ci.basePipelineHandle = VK_NULL_HANDLE;
     ci.basePipelineIndex = -1;
@@ -631,12 +761,15 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
             g_pipelines[(uint64_t)out[i]] = id;
             std::string stages;
             bool quad_fs = false;
+            int world = -1;  // index into kWorldShaders
             for (uint32_t s = 0; s < ci[i].stageCount; ++s) {
                 auto m = g_modules.find((uint64_t)ci[i].pStages[s].module);
                 bool fs = ci[i].pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
                 stages += fs ? " fs=" : " vs=";
                 stages += m != g_modules.end() ? m->second : "?";
                 if (fs && m != g_modules.end() && m->second == kQuadFragShader) quad_fs = true;
+                for (int w = 0; fs && m != g_modules.end() && w < static_cast<int>(std::size(kWorldShaders)); ++w)
+                    if (m->second == kWorldShaders[w].game) world = w;
             }
             const char* blend = "?";
             if (ci[i].pColorBlendState && ci[i].pColorBlendState->attachmentCount)
@@ -657,9 +790,33 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
             }
             g_pipe_info[(uint64_t)out[i]] = std::move(pi);
             if (quad_fs) {
-                VkPipeline twin = make_xbr_twin(d, c, ci[i]);
+                VkPipeline twin = own_module(d, kXbrFrag, sizeof kXbrFrag, &g_xbr_module)
+                                      ? make_twin(d, c, ci[i], g_xbr_module)
+                                      : VK_NULL_HANDLE;
                 if (twin) g_xbr_twin[(uint64_t)out[i]] = twin;
                 logf("  xbr twin for pipe#%u: %s", id, twin ? "ok" : "FAILED");
+            }
+            if (world >= 0) {
+                const WorldShader& ws = kWorldShaders[world];
+                // kPass (constant_id 0 in world_object.frag): 0 all pixels, 1 opaque, 2 the rest
+                static const int32_t kPasses[3] = {0, 1, 2};
+                VkSpecializationMapEntry entry{0, 0, sizeof(int32_t)};
+                VkSpecializationInfo spec[3];
+                for (int k = 0; k < 3; ++k) spec[k] = {1, &entry, sizeof(int32_t), &kPasses[k]};
+                VkPipeline twin = VK_NULL_HANDLE, partial = VK_NULL_HANDLE;
+                if (own_module(d, ws.code, ws.size, &g_world_modules[world])) {
+                    if (ws.split) partial = make_twin(d, c, ci[i], g_world_modules[world], &spec[2], true);
+                    twin = make_twin(d, c, ci[i], g_world_modules[world], ws.split ? &spec[partial ? 1 : 0] : nullptr);
+                    if (partial && !twin) {
+                        auto destroy = reinterpret_cast<PFN_vkDestroyPipeline>(real_GDPA(d, "vkDestroyPipeline"));
+                        if (destroy) destroy(d, partial, nullptr);
+                        partial = VK_NULL_HANDLE;
+                    }
+                }
+                if (twin) g_world_twin[(uint64_t)out[i]] = twin;
+                if (partial) g_world_partial[(uint64_t)out[i]] = partial;
+                logf("  world twin for pipe#%u (%s): %s%s", id, ws.game, twin ? "ok" : "FAILED",
+                     ws.split ? (partial ? ", split" : ", NOT split") : "");
             }
         }
     }
@@ -768,6 +925,8 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkR
     CmdState& st = g_cmd[cb];
     st.scale = scale;
     st.area = big.renderArea;
+    st.in_pass = true;
+    st.deferred.clear();
     if (scale > 1) apply_dynamic_state(cb, st, scale);
 }
 
@@ -789,11 +948,17 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderingKHR(VkCommandBuffer cb, const V
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
+    VkPipeline bound = p;
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
-        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) g_cmd[cb].pipeline = (uint64_t)p;
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            g_cmd[cb].pipeline = (uint64_t)p;  // the game's: what the proxy looks things up by
+            auto twin = g_world_on ? g_world_twin.find((uint64_t)p) : g_world_twin.end();
+            if (twin != g_world_twin.end()) bound = twin->second;
+            g_cmd[cb].bound = (uint64_t)bound;
+        }
     }
-    real_vkCmdBindPipeline(cb, bp, p);
+    real_vkCmdBindPipeline(cb, bp, bound);
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp,
@@ -809,6 +974,15 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipe
             auto& l = g_cmd[cb].set_layouts;
             if (l.size() < first + n) l.resize(first + n);
             for (uint32_t i = 0; i < n; ++i) l[first + i] = (uint64_t)layout;
+            CmdState& st = g_cmd[cb];
+            auto call = std::make_shared<SetCall>();
+            call->layout = (uint64_t)layout;
+            call->first = first;
+            call->sets.assign(sets, sets + n);
+            call->dyn.assign(dyn, dyn + ndyn);
+            call->seq = ++st.seq;
+            if (st.set_calls.size() < first + n) st.set_calls.resize(first + n);
+            for (uint32_t i = 0; i < n; ++i) st.set_calls[first + i] = call;
         }
     }
     real_vkCmdBindDescriptorSets(cb, bp, layout, first, n, sets, ndyn, dyn);
@@ -851,8 +1025,9 @@ struct HdBind {
     bool any() const { return ours[0] || ours[1]; }
 };
 
-// Our copy of the draw's set s when that set holds only one texture and it has a twin.
-VkDescriptorSet hd_set_for(const CmdState& st, size_t s) {
+// Our copy of the draw's set s when that set holds only one texture and it has a twin
+// (whose kind goes to *kind).
+VkDescriptorSet hd_set_for(const CmdState& st, size_t s, HdImage::Kind* kind) {
     if (s >= st.sets.size() || s >= st.set_layouts.size() || !st.set_layouts[s]) return VK_NULL_HANDLE;
     auto set = g_sets.find(st.sets[s]);
     auto dsl = g_set_layout.find(st.sets[s]);
@@ -864,6 +1039,7 @@ VkDescriptorSet hd_set_for(const CmdState& st, size_t s) {
     auto v = g_view_image.find(b0->view);
     auto hd = v == g_view_image.end() ? g_hd.end() : g_hd.find(v->second);
     if (hd == g_hd.end()) return VK_NULL_HANDLE;
+    *kind = hd->second.kind;
     auto key = std::make_tuple((uint64_t)hd->second.view, b0->sampler, dsl->second);
     auto cached = g_hd_sets.find(key);
     if (cached != g_hd_sets.end()) return cached->second;
@@ -903,8 +1079,14 @@ HdBind hd_bind_for(VkCommandBuffer cb) {
     HdBind hb;
     if (g_hd.empty() || !g_hd_on) return hb;
     CmdState& st = g_cmd[cb];
+    HdImage::Kind kind[HdBind::kSets] = {};
+    for (size_t s = 0; s < HdBind::kSets; ++s) hb.ours[s] = hd_set_for(st, s, &kind[s]);
+    // The wall shader samples the wall (set 0) at uv * mask size / wall size (the mask in
+    // set 1, sampled at uv), so a wall twin goes only with its mask's twin and vice versa.
+    bool wall = hb.ours[0] && kind[0] == HdImage::kWall, mask = hb.ours[1] && kind[1] == HdImage::kWallMask;
+    if (wall != mask) hb.ours[wall ? 0 : 1] = VK_NULL_HANDLE;
     for (size_t s = 0; s < HdBind::kSets; ++s)
-        if ((hb.ours[s] = hd_set_for(st, s))) {
+        if (hb.ours[s]) {
             hb.original[s] = (VkDescriptorSet)st.sets[s];
             hb.layout[s] = (VkPipelineLayout)st.set_layouts[s];
         }
@@ -959,9 +1141,119 @@ VkPipeline xbr_twin_for(VkCommandBuffer cb, VkPipeline* original) {
     return twin->second;
 }
 
+// After an object draw through a split twin (g_world_partial): remember it, with the textures
+// it drew with, to draw its partly covered pixels at the end of the render pass.
+void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    CmdState& st = g_cmd[cb];
+    if (!st.in_pass || !g_world_on) return;
+    auto partial = g_world_partial.find(st.pipeline);
+    auto twin = g_world_twin.find(st.pipeline);
+    if (partial == g_world_partial.end() || twin == g_world_twin.end() || st.bound != (uint64_t)twin->second) return;
+    Deferred d;
+    d.pipeline = partial->second;
+    for (size_t s = 0; s < HdBind::kSets; ++s) {
+        if (hb.ours[s]) {
+            d.set[s] = hb.ours[s];
+            d.layout[s] = hb.layout[s];
+        } else if (s < st.sets.size() && s < st.set_layouts.size()) {
+            d.set[s] = (VkDescriptorSet)st.sets[s];
+            d.layout[s] = (VkPipelineLayout)st.set_layouts[s];
+        }
+        // the object shaders' sets hold one texture each; one with dynamic offsets is not ours to repeat
+        bool dyn = s < st.set_calls.size() && st.set_calls[s] && !st.set_calls[s]->dyn.empty();
+        if (!d.set[s] || !d.layout[s] || dyn) return;
+    }
+    d.pushes = st.pushes;
+    d.vbs = st.vbs;
+    d.ib = st.ib;
+    d.ib_off = st.ib_off;
+    d.ib_type = st.ib_type;
+    d.args = args;
+    d.viewports = st.viewports;
+    d.scissors = st.scissors;
+    st.deferred.push_back(std::move(d));
+}
+
+void issue_pushes(VkCommandBuffer cb, std::vector<PushRec> pushes) {
+    std::sort(pushes.begin(), pushes.end(), [](const PushRec& a, const PushRec& b) { return a.seq < b.seq; });
+    for (auto& p : pushes)
+        real_vkCmdPushConstants(cb, (VkPipelineLayout)p.layout, p.stages, p.offset, p.size, p.bytes);
+}
+
+void issue_buffers(VkCommandBuffer cb, const std::vector<std::pair<uint64_t, VkDeviceSize>>& vbs, uint64_t ib,
+                   VkDeviceSize ib_off, VkIndexType ib_type) {
+    for (uint32_t i = 0; i < vbs.size(); ++i)
+        if (vbs[i].first) {
+            VkBuffer b = (VkBuffer)vbs[i].first;
+            real_vkCmdBindVertexBuffers(cb, i, 1, &b, &vbs[i].second);
+        }
+    if (ib) real_vkCmdBindIndexBuffer(cb, (VkBuffer)ib, ib_off, ib_type);
+}
+
+void issue_dynamic_state(VkCommandBuffer cb, const std::vector<VkViewport>& vp, const std::vector<VkRect2D>& sc,
+                         int s) {
+    std::vector<VkViewport> v;
+    for (auto& x : vp) v.push_back(scaled(x, s));
+    if (!v.empty()) real_vkCmdSetViewport(cb, 0, static_cast<uint32_t>(v.size()), v.data());
+    std::vector<VkRect2D> r;
+    for (auto& x : sc) r.push_back(scaled(x, s));
+    if (!r.empty()) real_vkCmdSetScissor(cb, 0, static_cast<uint32_t>(r.size()), r.data());
+}
+
+// Before the render pass ends: the deferred draws' partly covered pixels, in the game's order,
+// then the game's state as it was.
+void flush_partial(VkCommandBuffer cb) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    CmdState& st = g_cmd[cb];
+    if (st.deferred.empty()) return;
+    if (g_trace) logf("    [partly covered pixels of %zu object draws]", st.deferred.size());
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const std::vector<VkViewport>* vp = &st.viewports;
+    const std::vector<VkRect2D>* sc = &st.scissors;
+    for (auto& d : st.deferred) {
+        if (d.pipeline != pipeline) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline = d.pipeline);
+        for (uint32_t s = 0; s < HdBind::kSets; ++s)
+            real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout[s], s, 1, &d.set[s], 0, nullptr);
+        issue_pushes(cb, d.pushes);
+        issue_buffers(cb, d.vbs, d.args.indexed ? d.ib : 0, d.ib_off, d.ib_type);
+        if (d.viewports.size() != vp->size() || d.scissors.size() != sc->size() ||
+            !std::equal(d.viewports.begin(), d.viewports.end(), vp->begin(),
+                        [](const VkViewport& a, const VkViewport& b) { return !memcmp(&a, &b, sizeof a); }) ||
+            !std::equal(d.scissors.begin(), d.scissors.end(), sc->begin(),
+                        [](const VkRect2D& a, const VkRect2D& b) { return !memcmp(&a, &b, sizeof a); })) {
+            issue_dynamic_state(cb, d.viewports, d.scissors, st.scale);
+            vp = &d.viewports;
+            sc = &d.scissors;
+        }
+        const DrawArgs& a = d.args;
+        if (a.indexed)
+            real_vkCmdDrawIndexed(cb, a.count, a.instances, a.first, a.vertex_offset, a.first_instance);
+        else
+            real_vkCmdDraw(cb, a.count, a.instances, a.first, a.first_instance);
+    }
+    st.deferred.clear();
+    // the game's state again: pipeline, sets (their binding calls in the game's order), push
+    // constants, buffers, viewports and scissors
+    if (st.bound) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)st.bound);
+    std::vector<std::shared_ptr<SetCall>> calls;
+    for (auto& c : st.set_calls)
+        if (c && std::find(calls.begin(), calls.end(), c) == calls.end()) calls.push_back(c);
+    std::sort(calls.begin(), calls.end(), [](const auto& a, const auto& b) { return a->seq < b->seq; });
+    for (auto& c : calls)
+        real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)c->layout, c->first,
+                                     static_cast<uint32_t>(c->sets.size()),
+                                     reinterpret_cast<const VkDescriptorSet*>(c->sets.data()),
+                                     static_cast<uint32_t>(c->dyn.size()), c->dyn.data());
+    issue_pushes(cb, st.pushes);
+    issue_buffers(cb, st.vbs, st.ib, st.ib_off, st.ib_type);
+    issue_dynamic_state(cb, st.viewports, st.scissors, st.scale);
+}
+
 // Swap in the xBR twin pipeline and/or an HD texture set around one draw.
 template <typename F>
-void substituted_draw(VkCommandBuffer cb, const char* kind, uint32_t count, F draw) {
+void substituted_draw(VkCommandBuffer cb, const char* kind, const DrawArgs& args, F draw) {
+    const uint32_t count = args.count;
     struct Timed {  // the proxy's time around each draw, while benchmarking
         double t0 = g_bench ? now_ms() : 0;
         bool hd = false, xbr = false;
@@ -986,6 +1278,7 @@ void substituted_draw(VkCommandBuffer cb, const char* kind, uint32_t count, F dr
         if (hb.ours[s])
             real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hb.layout[s], s, 1, &hb.ours[s], 0, nullptr);
     draw();
+    defer_partial(cb, hb, args);
     for (uint32_t s = 0; s < HdBind::kSets; ++s)
         if (hb.ours[s])
             real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hb.layout[s], s, 1, &hb.original[s], 0,
@@ -1024,13 +1317,14 @@ void record_draw(VkCommandBuffer cb, bool indexed, uint32_t first, uint32_t coun
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
     record_draw(cb, false, fv, vc, 0);
-    substituted_draw(cb, "draw", vc, [&] { real_vkCmdDraw(cb, vc, ic, fv, fi); });
+    substituted_draw(cb, "draw", DrawArgs{false, vc, ic, fv, 0, fi}, [&] { real_vkCmdDraw(cb, vc, ic, fv, fi); });
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_t ic, uint32_t fi,
                                                 int32_t vo, uint32_t fin) {
     record_draw(cb, true, fi, n, vo);
-    substituted_draw(cb, "drawIndexed", n, [&] { real_vkCmdDrawIndexed(cb, n, ic, fi, vo, fin); });
+    substituted_draw(cb, "drawIndexed", DrawArgs{true, n, ic, fi, vo, fin},
+                     [&] { real_vkCmdDrawIndexed(cb, n, ic, fi, vo, fin); });
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n,
@@ -1116,11 +1410,21 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineL
         }
         logf("    pushConstants stages=%x off=%u size=%u:%s", static_cast<unsigned>(stages), offset, size, s.c_str());
     }
-    if (offset + size <= sizeof(CmdState::pc)) {  // kept for the world draw log
+    if (offset + size <= sizeof(CmdState::pc)) {  // kept for the world draw log and for draws issued again
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         CmdState& st = g_cmd[cb];
         memcpy(st.pc + offset, values, size);
         st.pc_size = std::max(st.pc_size, offset + size);
+        PushRec* rec = nullptr;
+        for (auto& p : st.pushes)
+            if (p.stages == stages && p.offset == offset && p.size == size) rec = &p;
+        if (!rec) rec = &st.pushes.emplace_back();
+        rec->layout = (uint64_t)layout;
+        rec->stages = stages;
+        rec->offset = offset;
+        rec->size = size;
+        memcpy(rec->bytes, values, size);
+        rec->seq = ++st.seq;
     }
     real_vkCmdPushConstants(cb, layout, stages, offset, size, values);
 }
@@ -1165,6 +1469,9 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyImage(VkCommandBuffer cb, VkImage src, Vk
                  img_desc((uint64_t)dst).c_str(), n, r[0].extent.width, r[0].extent.height);
         warn_if_enlarged("copyImage src", (uint64_t)src);
         warn_if_enlarged("copyImage dst", (uint64_t)dst);
+        static unsigned logged = 0;
+        if (g_hd.count((uint64_t)dst) && logged++ < 50)  // its HD twin would now be stale
+            logf("copyImage into %s, which has an HD twin, frame %u", img_desc((uint64_t)dst).c_str(), g_frame);
     }
     real_vkCmdCopyImage(cb, src, sl, dst, dl, n, r);
 }
@@ -1353,8 +1660,8 @@ void free_staging(Staging& s) {
     s = Staging{};
 }
 
-// Host-visible buffer holding a replacement file (rp.w x rp.h BGRA), or empty.
-Staging load_staging(const Replacement& rp) {
+// A host-visible buffer of `size` bytes, mapped at *ptr, or an empty Staging.
+Staging new_staging(VkDeviceSize size, void** ptr) {
     Staging st;
     auto create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(device_fn("vkCreateBuffer"));
     auto requirements =
@@ -1365,7 +1672,6 @@ Staging load_staging(const Replacement& rp) {
     if (!create_buffer || !requirements || !allocate || !bind || !map) return st;
 
     double t0 = now_ms();
-    VkDeviceSize size = 1ull * rp.bpp * rp.w * rp.h;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -1377,26 +1683,303 @@ Staging load_staging(const Replacement& rp) {
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = type;
-    void* ptr = nullptr;
     if (type == UINT32_MAX || allocate(g_device, &ai, nullptr, &st.memory) != VK_SUCCESS) st.memory = VK_NULL_HANDLE;
+    if (!st.memory || bind(g_device, st.buffer, st.memory, 0) != VK_SUCCESS ||
+        map(g_device, st.memory, 0, size, 0, ptr) != VK_SUCCESS)
+        free_staging(st);
+    g_perf.alloc += now_ms() - t0;
+    return st;
+}
+
+// Host-visible buffer holding a replacement file (rp.w x rp.h, rp.bpp bytes per texel), or
+// empty. Read here and now: font atlases (HD twins go through queue_file).
+Staging load_staging(const Replacement& rp) {
+    VkDeviceSize size = 1ull * rp.bpp * rp.w * rp.h;
+    void* ptr = nullptr;
+    Staging st = new_staging(size, &ptr);
+    if (!st.buffer) return st;
     size_t got = 0;
-    if (st.memory && bind(g_device, st.buffer, st.memory, 0) == VK_SUCCESS &&
-        map(g_device, st.memory, 0, size, 0, &ptr) == VK_SUCCESS) {
-        double t1 = now_ms();
-        g_perf.alloc += t1 - t0;
-        if (FILE* f = fopen(rp.path.c_str(), "rb")) {
-            got = fread(ptr, 1, static_cast<size_t>(size), f);
-            fclose(f);
-        }
-        g_perf.file += now_ms() - t1;
-        g_perf.mb += got / 1048576.0;
-        ++g_perf.loaded;
+    if (FILE* f = fopen(rp.path.c_str(), "rb")) {
+        got = fread(ptr, 1, static_cast<size_t>(size), f);
+        fclose(f);
     }
     if (got != size) {
         logf("replace: could not read %s (%u bytes)", rp.path.c_str(), static_cast<unsigned>(got));
         free_staging(st);
     }
     return st;
+}
+
+// src (w/s x h/s texels of bpp bytes) magnified s times, nearest, into dst (w x h): each row
+// magnified once, then copied s times (dst may be a write-combined mapping).
+void magnify(unsigned char* dst, const unsigned char* src, uint32_t w, uint32_t h, uint32_t bpp, uint32_t s) {
+    uint32_t w1 = w / s, row = w * bpp;
+    std::vector<unsigned char> line(row);
+    for (uint32_t y1 = 0; y1 < h / s; ++y1) {
+        for (uint32_t x = 0; x < w; ++x) memcpy(&line[1ull * x * bpp], src + (1ull * y1 * w1 + x / s) * bpp, bpp);
+        for (uint32_t k = 0; k < s; ++k) memcpy(dst + (1ull * y1 * s + k) * row, line.data(), row);
+    }
+}
+
+// A wall's coverage mask (1x, 0/255) at s times the size with its stair-stepped edges redrawn
+// as straight, anti-aliased lines, the way tools/stairs.py redraws the wall tops (keep the two
+// in step: the wall tops sit on these edges). The wall shader multiplies the wall's colour by
+// the mask and blends, so the partial values give soft edges. For each 1x pixel on an outline
+// the line through its neighbourhood is fitted: for each slope (+1/2, -1/2, 0, vertical) and
+// side, the pixel centres bound its offset to an interval; the widest feasible one wins, its
+// middle is taken; smaller neighbourhoods are tried near corners; with no line, nearest.
+struct StairLine {
+    int slope;  // index into kStairSlopes, or 3: vertical
+    double c;
+    bool below;  // inside is below (right of) the line
+};
+const double kStairSlopes[3] = {0.5, -0.5, 0.0};
+const int kStairWindows[3][2] = {{3, 2}, {2, 1}, {1, 1}};
+const int kStairSamples = 4;
+// A wall face's sloped top edge is moved this far up (1x pixels): the wall top drawn on it has
+// a soft edge too, and two soft edges over each other let what is behind the wall show through
+// (up to a quarter where each covers half). Moved, the face is solid under the wall top's edge.
+// tools/stairs.py upscale(grow_top=) does the same.
+const double kWallTopGrow = 0.4;
+
+bool stair_fit(const unsigned char* m, int w, int h, int x, int y, StairLine* line) {
+    const double inf = 1e300;
+    for (auto& win : kStairWindows) {
+        double best = -1;
+        for (int si = 0; si < 4; ++si)
+            for (int below = 1; below >= 0; --below) {
+                double lo = -inf, hi = inf;
+                for (int py = std::max(0, y - win[1]); py <= std::min(h - 1, y + win[1]); ++py)
+                    for (int px = std::max(0, x - win[0]); px <= std::min(w - 1, x + win[0]); ++px) {
+                        double cx = px + 0.5, cy = py + 0.5;
+                        double v = si == 3 ? cx : cy - kStairSlopes[si] * cx;
+                        if ((m[py * w + px] != 0) == (below != 0))
+                            hi = std::min(hi, v);
+                        else
+                            lo = std::max(lo, v);
+                    }
+                if (lo < hi && lo > -inf && hi < inf && hi - lo > best) {
+                    best = hi - lo;
+                    *line = StairLine{si, (lo + hi) / 2, below != 0};
+                }
+            }
+        if (best >= 0) return true;
+    }
+    return false;
+}
+
+void stair_coverage(unsigned char* dst, const unsigned char* m, int w, int h, int s) {
+    int W = w * s;
+    std::vector<unsigned char> out(static_cast<size_t>(W) * h * s);
+    const int n = kStairSamples * kStairSamples;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            bool on = m[y * w + x] != 0;
+            bool edge = false;
+            for (int yy = std::max(0, y - 1); yy <= std::min(h - 1, y + 1) && !edge; ++yy)
+                for (int xx = std::max(0, x - 1); xx <= std::min(w - 1, x + 1); ++xx)
+                    if ((m[yy * w + xx] != 0) != on) edge = true;
+            StairLine line{};
+            bool fitted = edge && stair_fit(m, w, h, x, y, &line);
+            if (fitted && line.slope < 2 && line.below) line.c -= kWallTopGrow;  // a face's top edge: under the wall top
+            for (int j = 0; j < s; ++j)
+                for (int i = 0; i < s; ++i) {
+                    int X = x * s + i, Y = y * s + j;
+                    unsigned char v = on ? 255 : 0;
+                    if (fitted) {
+                        int hits = 0;
+                        for (int b = 0; b < kStairSamples; ++b)
+                            for (int a = 0; a < kStairSamples; ++a) {
+                                double sx = (X + (a + 0.5) / kStairSamples) / s, sy = (Y + (b + 0.5) / kStairSamples) / s;
+                                double t = line.slope == 3 ? sx : sy - kStairSlopes[line.slope] * sx;
+                                hits += line.below ? t >= line.c : t <= line.c;
+                            }
+                        v = static_cast<unsigned char>((hits * 255 + n / 2) / n);
+                    }
+                    // stored with whether the 1x pixel was covered (tools/stairs.py mark): 128-255,
+                    // or 0-127 for a pixel the edges add, which world_wall.frag pushes back a little
+                    out[static_cast<size_t>(Y) * W + X] = static_cast<unsigned char>((on ? 128 : 0) + (v * 127 + 127) / 255);
+                }
+        }
+    memcpy(dst, out.data(), out.size());  // dst may be a write-combined mapping
+}
+
+// Replacement files for HD twins are read by worker threads. The first open of a file costs
+// ~5 ms (the antivirus scans it), reading it ~0.1 ms, and opens overlap (16 at once: ~0.5 ms
+// a file), so a lot, floor or camera view that brings hundreds of new files no longer waits
+// for them one by one. A read fills its staging buffer's mapping; vkQueueSubmit waits for
+// every read queued before it (the copies from those buffers are in what it submits).
+struct FileJob {
+    std::string path;
+    unsigned char* dst = nullptr;      // the staging buffer's mapping
+    std::vector<unsigned char> under;  // the game's 1x upload
+    uint32_t w = 0, h = 0, bpp = 4;    // the file's (scaled) size
+    bool wall = false;
+    const Packed* packed = nullptr;    // in a pack: read from there, not from path
+};
+std::mutex g_jobs_mu;
+std::condition_variable g_jobs_cv, g_jobs_done;
+std::deque<FileJob> g_jobs;
+unsigned g_jobs_pending = 0;  // queued or being read
+unsigned g_jobs_loaded = 0;   // since the last wait_files
+double g_jobs_mb = 0;
+std::vector<std::string> g_jobs_failed;
+const unsigned kFileWorkers = 16;
+
+// One job: the file into its staging buffer. For a wall (see g_wall_masks, B8G8R8A8) the
+// file's premultiplied pixels are drawn over the upload, magnified, so its corners (wall top,
+// repeated bottom row) come from the game and the result is opaque like the game's. A file
+// that cannot be read leaves the game's own pixels, magnified.
+bool read_job(FileJob& j) {
+    std::vector<unsigned char> px(1ull * j.w * j.h * j.bpp);
+    size_t got = 0;
+    if (j.packed) {  // positional reads on a shared handle: safe from several threads
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(j.packed->offset);
+        ov.OffsetHigh = static_cast<DWORD>(j.packed->offset >> 32);
+        DWORD n = 0;
+        if (j.packed->size == px.size() && ReadFile(j.packed->file, px.data(), j.packed->size, &n, &ov)) got = n;
+    } else if (FILE* f = fopen(j.path.c_str(), "rb")) {
+        got = fread(px.data(), 1, px.size(), f);
+        fclose(f);
+    }
+    uint32_t s = static_cast<uint32_t>(g_layer_scale);
+    if (got != px.size()) {
+        magnify(j.dst, j.under.data(), j.w, j.h, j.bpp, s);
+        return false;
+    }
+    if (j.wall)  // composed in cached memory, then copied: the mapping is write-combined
+        for (uint32_t y = 0; y < j.h; ++y)
+            for (uint32_t x = 0; x < j.w; ++x) {
+                unsigned char* o = &px[(1ull * y * j.w + x) * 4];
+                unsigned a = o[3];
+                if (a == 255) continue;  // most of a wall
+                const unsigned char* u = &j.under[(1ull * (y / s) * (j.w / s) + x / s) * 4];
+                for (int c = 0; c < 3; ++c) o[c] = static_cast<unsigned char>(o[c] + (u[c] * (255 - a) + 127) / 255);
+                o[3] = 255;
+            }
+    memcpy(j.dst, px.data(), px.size());
+    return true;
+}
+
+DWORD WINAPI file_worker(void*) {
+    for (;;) {
+        FileJob j;
+        {
+            std::unique_lock<std::mutex> lk(g_jobs_mu);
+            g_jobs_cv.wait(lk, [] { return !g_jobs.empty(); });
+            j = std::move(g_jobs.front());
+            g_jobs.pop_front();
+        }
+        bool ok = read_job(j);
+        _mm_sfence();  // the write-combined stores reach memory before the submit that waits for this
+        std::lock_guard<std::mutex> lk(g_jobs_mu);
+        if (ok) {
+            ++g_jobs_loaded;
+            g_jobs_mb += 1.0 * j.w * j.h * j.bpp / 1048576.0;
+        } else {
+            g_jobs_failed.push_back(j.path);
+        }
+        if (--g_jobs_pending == 0) g_jobs_done.notify_all();
+    }
+}
+
+void queue_file(FileJob&& j) {
+    static unsigned workers = [] {
+        unsigned n = 0;
+        for (unsigned i = 0; i < kFileWorkers; ++i)
+            if (HANDLE t = CreateThread(nullptr, 0, file_worker, nullptr, 0, nullptr)) {
+                CloseHandle(t);
+                ++n;
+            }
+        logf("replace: %u file reader threads", n);
+        return n;
+    }();
+    std::lock_guard<std::mutex> lk(g_jobs_mu);
+    if (!workers) {  // no threads: read here
+        bool ok = read_job(j);
+        ok ? (void)++g_jobs_loaded : g_jobs_failed.push_back(j.path);
+        return;
+    }
+    ++g_jobs_pending;
+    g_jobs.push_back(std::move(j));
+    g_jobs_cv.notify_one();
+}
+
+// Wait for every queued read (before a submit, or before freeing staging buffers); the wait
+// and what was read go to g_perf ("files").
+void wait_files() {
+    double t0 = now_ms();
+    unsigned loaded;
+    double mb;
+    std::vector<std::string> failed;
+    {
+        std::unique_lock<std::mutex> lk(g_jobs_mu);
+        if (!g_jobs_pending && !g_jobs_loaded && g_jobs_failed.empty()) return;
+        g_jobs_done.wait(lk, [] { return g_jobs_pending == 0; });
+        loaded = g_jobs_loaded;
+        mb = g_jobs_mb;
+        failed.swap(g_jobs_failed);
+        g_jobs_loaded = 0;
+        g_jobs_mb = 0;
+    }
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    g_perf.file += now_ms() - t0;
+    g_perf.loaded += loaded;
+    g_perf.mb += mb;
+    for (auto& p : failed) logf("replace: could not read %s (showing the game's pixels)", p.c_str());
+}
+
+// The antivirus scans a file the first time it is opened (~5 ms) and remembers it: later
+// opens take ~0.03 ms, from any process. When the device is created (the game's loading
+// screen) background threads open every replacement file once, so the first lot, floor or
+// camera view that needs them does not wait for the scans. VKPROXY_WARMUP=0: off.
+std::vector<std::string> g_warm_files;
+std::atomic<size_t> g_warm_next{0};
+std::atomic<unsigned> g_warm_left{0};
+double g_warm_t0 = 0;
+const unsigned kWarmThreads = 8;
+
+DWORD WINAPI warm_worker(void*) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (size_t i; (i = g_warm_next++) < g_warm_files.size();) {
+        HANDLE f = CreateFileA(g_warm_files[i].c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+    if (--g_warm_left == 0) {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        logf("warm-up: opened %u replacement files in %.1f s", static_cast<unsigned>(g_warm_files.size()),
+             (now_ms() - g_warm_t0) / 1000);
+    }
+    return 0;
+}
+
+DWORD WINAPI warm_start(void*) {
+    g_warm_t0 = now_ms();
+    WIN32_FIND_DATAA fd;
+    HANDLE find = FindFirstFileA((g_replace_dir + "\\*").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) g_warm_files.push_back(g_replace_dir + "\\" + fd.cFileName);
+    while (FindNextFileA(find, &fd));
+    FindClose(find);
+    g_warm_left = kWarmThreads;
+    for (unsigned i = 0; i < kWarmThreads; ++i)
+        if (HANDLE t = CreateThread(nullptr, 0, warm_worker, nullptr, 0, nullptr))
+            CloseHandle(t);
+        else
+            --g_warm_left;
+    return 0;
+}
+
+void start_warmup() {
+    static bool started = false;
+    char buf[8];
+    if (started || !g_replace_on ||
+        (GetEnvironmentVariableA("VKPROXY_WARMUP", buf, sizeof buf) && buf[0] == '0'))
+        return;
+    started = true;
+    if (HANDLE t = CreateThread(nullptr, 0, warm_start, nullptr, 0, nullptr)) CloseHandle(t);
 }
 
 // Staging for a font atlas, kept for the session: the game recreates its atlases
@@ -1415,7 +1998,21 @@ VkBuffer staging_for(const Replacement& rp) {
 const unsigned kStagingFrames = 16;
 std::vector<std::pair<Staging, unsigned>> g_staging_retire;  // staging, frame recorded
 
+// Staging for HD twins: one host-visible buffer made while the game loads and mapped for the
+// session, used as a ring: each upload takes the next bytes and gives them back kStagingFrames
+// presents later. A buffer per upload cost ~0.08 ms (create, allocate, map), hundreds of them
+// when a floor or camera view comes in. What does not fit gets a buffer of its own.
+const VkDeviceSize kRingBytes = 256ull << 20;  // a lot's first view: ~180 MB
+struct Ring {
+    Staging st;
+    unsigned char* ptr = nullptr;
+    VkDeviceSize size = 0, head = 0, used = 0;
+    std::deque<std::pair<VkDeviceSize, unsigned>> live;  // (bytes taken, frame), oldest first
+};
+Ring g_ring;
+
 void free_retired_staging(bool all) {
+    wait_files();  // nothing in flight writes into them (a recorded upload never submitted)
     size_t keep = 0;
     for (auto& s : g_staging_retire) {
         if (all || g_frame - s.second > kStagingFrames)
@@ -1424,33 +2021,170 @@ void free_retired_staging(bool all) {
             g_staging_retire[keep++] = s;
     }
     g_staging_retire.resize(keep);
+    while (!g_ring.live.empty() && (all || g_frame - g_ring.live.front().second > kStagingFrames)) {
+        g_ring.used -= g_ring.live.front().first;
+        g_ring.live.pop_front();
+    }
 }
 
-// Index the content replacements once: <replace>\<w>x<h>_<hash>@<scale>.bgra (sprites)
-// and <w>x<h>_<hash>_f9@<scale>.raw (sprite depth textures, R8: tools/hd_art.py).
+void make_ring() {
+    void* ptr = nullptr;
+    g_ring.st = new_staging(kRingBytes, &ptr);
+    g_ring.ptr = static_cast<unsigned char*>(ptr);
+    g_ring.size = g_ring.st.buffer ? kRingBytes : 0;
+    logf("hd: staging ring of %u MB%s", static_cast<unsigned>(kRingBytes >> 20), g_ring.size ? "" : " NOT made");
+}
+
+// `size` bytes of staging for an HD twin, mapped at *ptr: a range of the ring, else a buffer
+// of its own (freed by free_retired_staging).
+Staging twin_staging(VkDeviceSize size, void** ptr) {
+    VkDeviceSize n = (size + 255) & ~VkDeviceSize{255}, start = g_ring.head, waste = 0;
+    if (start + n > g_ring.size) {  // wraps: the bytes left at the end go with it
+        waste = g_ring.size - start;
+        start = 0;
+    }
+    if (g_ring.size && g_ring.used + waste + n <= g_ring.size) {
+        g_ring.head = start + n;
+        g_ring.used += waste + n;
+        g_ring.live.emplace_back(waste + n, g_frame);
+        *ptr = g_ring.ptr + start;
+        Staging st;
+        st.buffer = g_ring.st.buffer;
+        st.offset = start;
+        return st;
+    }
+    Staging st = new_staging(size, ptr);
+    if (st.buffer) g_staging_retire.push_back({st, g_frame});
+    return st;
+}
+
+// A content replacement file name for this scale, <w>x<h>_<hash>@<scale>.bgra (sprites),
+// <w>x<h>_<hash>_f9@<scale>.raw (sprite depth textures, R8) or <w>x<h>_<hash>_w<mask>@<scale>.bgra
+// (walls), goes into g_hd_names; true if it is one.
+bool index_file(const std::string& n) {
+    std::string bgra = "@" + std::to_string(g_layer_scale) + ".bgra", raw = "@" + std::to_string(g_layer_scale) + ".raw";
+    auto ends = [&](const std::string& e) { return n.size() > e.size() && !n.compare(n.size() - e.size(), e.size(), e); };
+    bool depth = ends(raw);
+    if (!depth && !ends(bgra)) return false;
+    size_t at = n.rfind('@');
+    unsigned w = 0, h = 0;
+    char hash[17] = {};
+    if (sscanf(n.c_str(), "%ux%u_%16[0-9a-f]", &w, &h, hash) != 3 || strlen(hash) != 16) return false;
+    std::string base = std::to_string(w) + "x" + std::to_string(h) + "_" + hash;
+    std::string rest = n.substr(0, at).substr(std::min(base.size(), at));
+    bool wall = !depth && rest.size() > 2 && rest.compare(0, 2, "_w") == 0 &&
+                rest.find_first_not_of("0123456789", 2) == std::string::npos;
+    if (n.compare(0, base.size(), base) != 0 || !(rest == (depth ? "_f9" : "") || wall)) return false;
+    g_hd_names.insert(n.substr(0, at));
+    if (!wall) (depth ? g_z_sizes : g_hd_sizes).insert({w, h});
+    return true;
+}
+
+// One pack's index (format: tools/hd_pack.py) into g_packed; the pack stays open.
+void index_pack(const std::string& path) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size;
+    struct {
+        uint32_t count;
+        uint64_t index_at;
+        char magic[4];
+        uint32_t version;
+    } __attribute__((packed)) foot;
+    auto read_at = [&](uint64_t at, void* dst, uint32_t n) {
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(at);
+        ov.OffsetHigh = static_cast<DWORD>(at >> 32);
+        DWORD got = 0;
+        return ReadFile(f, dst, n, &got, &ov) && got == n;
+    };
+    std::vector<char> index;
+    bool ok = GetFileSizeEx(f, &size) && size.QuadPart >= static_cast<LONGLONG>(sizeof foot) &&
+              read_at(size.QuadPart - sizeof foot, &foot, sizeof foot) && !memcmp(foot.magic, "HDPK", 4) &&
+              foot.version == 1 && foot.index_at <= size.QuadPart - sizeof foot &&
+              size.QuadPart - sizeof foot - foot.index_at < (64u << 20);
+    if (ok) {
+        index.resize(static_cast<size_t>(size.QuadPart - sizeof foot - foot.index_at));
+        ok = read_at(foot.index_at, index.data(), static_cast<uint32_t>(index.size()));
+    }
+    unsigned n = 0;
+    for (size_t p = 0; ok && n < foot.count; ++n) {
+        uint16_t len;
+        uint64_t off;
+        uint32_t bytes;
+        if (p + 2 > index.size() || (memcpy(&len, &index[p], 2), len > 200) || p + 2 + len + 20 > index.size()) {
+            ok = false;
+            break;
+        }
+        std::string name(&index[p + 2], len);
+        memcpy(&off, &index[p + 2 + len], 8);
+        memcpy(&bytes, &index[p + 2 + len + 8], 4);
+        p += 2 + len + 20;
+        if (off + bytes > foot.index_at || name.find_first_not_of("0123456789abcdefwx_@.rgw") != std::string::npos) {
+            ok = false;
+            break;
+        }
+        if (index_file(name)) g_packed[name] = Packed{f, off, bytes};
+    }
+    if (!ok) logf("hd: %s is not a pack (or is damaged): files from it may be missing", path.c_str());
+    g_pack_files.push_back(f);
+}
+
+// Index the content replacements once, while the game loads (swapchain creation): the packs
+// (tools/hd_pack.py) in name order, a later pack's copy winning, then the loose files, which
+// win over the packs.
 void scan_hd_files() {
     g_hd_scanned = true;
-    for (bool depth : {false, true}) {
-        WIN32_FIND_DATAA fd;
-        std::string pattern = g_replace_dir + "\\*x*_*@" + std::to_string(g_layer_scale) + (depth ? ".raw" : ".bgra");
-        HANDLE find = FindFirstFileA(pattern.c_str(), &fd);
-        if (find == INVALID_HANDLE_VALUE) continue;
+    double t0 = now_ms();
+    WIN32_FIND_DATAA fd;
+    std::vector<std::string> packs, loose;
+    HANDLE find = FindFirstFileA((g_replace_dir + "\\*").c_str(), &fd);
+    if (find != INVALID_HANDLE_VALUE) {
         do {
             std::string n = fd.cFileName;
-            unsigned w = 0, h = 0;
-            char hash[17] = {};
-            size_t at = n.rfind('@');
-            if (at != std::string::npos && sscanf(n.c_str(), "%ux%u_%16[0-9a-f]", &w, &h, hash) == 3 &&
-                strlen(hash) == 16 &&
-                n.substr(0, at) == std::to_string(w) + "x" + std::to_string(h) + "_" + hash + (depth ? "_f9" : "")) {
-                g_hd_names.insert(n.substr(0, at));
-                (depth ? g_z_sizes : g_hd_sizes).insert({w, h});
-            }
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (n.size() == 12 && !n.compare(0, 3, "hd_") && !n.compare(7, 5, ".pack"))
+                packs.push_back(n);
+            else
+                loose.push_back(n);
         } while (FindNextFileA(find, &fd));
         FindClose(find);
     }
-    logf("hd: %u content replacements (%u depth sizes) in %s", static_cast<unsigned>(g_hd_names.size()),
-         static_cast<unsigned>(g_z_sizes.size()), g_replace_dir.c_str());
+    std::sort(packs.begin(), packs.end());
+    for (auto& p : packs) index_pack(g_replace_dir + "\\" + p);
+    for (auto& n : loose)
+        if (index_file(n)) g_packed.erase(n);
+    logf("hd: %u packs (%u files in them), %u loose files, indexed in %.0f ms", static_cast<unsigned>(packs.size()),
+         static_cast<unsigned>(g_packed.size()), static_cast<unsigned>(loose.size()), now_ms() - t0);
+    // wall coverage masks: "WMSK", u32 w, h, count, then count x w*h bytes
+    find = FindFirstFileA((g_replace_dir + "\\*.wallmasks").c_str(), &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            FILE* f = fopen((g_replace_dir + "\\" + fd.cFileName).c_str(), "rb");
+            if (!f) continue;
+            char magic[4];
+            uint32_t head[3];
+            if (fread(magic, 1, 4, f) == 4 && !memcmp(magic, "WMSK", 4) && fread(head, 4, 3, f) == 3 &&
+                head[0] && head[1] && head[0] * head[1] <= (1u << 22) && head[2] <= 1024) {
+                auto& masks = g_wall_masks[{head[0], head[1]}];
+                std::vector<unsigned char> m(1ull * head[0] * head[1]);
+                for (uint32_t i = 0; i < head[2] && fread(m.data(), 1, m.size(), f) == m.size(); ++i) {
+                    WallMask runs;
+                    for (uint32_t p = 0; p < m.size(); ++p)
+                        if (m[p] && (!p || !m[p - 1]))
+                            runs.emplace_back(p, 1);
+                        else if (m[p])
+                            ++runs.back().second;
+                    masks.push_back(std::move(runs));
+                }
+            }
+            fclose(f);
+        } while (FindNextFileA(find, &fd));
+        FindClose(find);
+    }
+    logf("hd: %u content replacements (%u depth sizes, %u wall sizes) in %s",
+         static_cast<unsigned>(g_hd_names.size()), static_cast<unsigned>(g_z_sizes.size()),
+         static_cast<unsigned>(g_wall_masks.size()), g_replace_dir.c_str());
 }
 
 // The descriptor sets made for draws with a twin (hd_bind_for); made again when needed.
@@ -1463,6 +2197,98 @@ void free_hd_sets(VkImageView view) {
     }
 }
 
+// HD twin images are bound to ranges of big device-local blocks, made while the game loads
+// (more when needed): an allocation per twin cost ~0.1 ms, hundreds of them when a floor or
+// camera view comes in. Large twins get memory of their own.
+const VkDeviceSize kBlockBytes = 128ull << 20;
+struct Block {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t type = 0;
+    std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size, adjacent ranges merged
+};
+std::vector<Block> g_blocks;
+
+bool new_block(uint32_t type) {
+    auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(device_fn("vkAllocateMemory"));
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = kBlockBytes;
+    ai.memoryTypeIndex = type;
+    Block b;
+    b.type = type;
+    if (!allocate || allocate(g_device, &ai, nullptr, &b.memory) != VK_SUCCESS) return false;
+    b.free[0] = kBlockBytes;
+    g_blocks.push_back(std::move(b));
+    return true;
+}
+
+// A range for req in a block of memory type `type` (first fit; a new block when none has
+// room): (block, offset), or block -1.
+std::pair<int, VkDeviceSize> block_alloc(const VkMemoryRequirements& req, uint32_t type) {
+    if (req.size > kBlockBytes / 8 || !req.alignment || (req.alignment & (req.alignment - 1))) return {-1, 0};
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < g_blocks.size(); ++i) {
+            Block& b = g_blocks[i];
+            if (b.type != type) continue;
+            for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+                VkDeviceSize start = it->first, end = it->first + it->second;
+                VkDeviceSize off = (start + req.alignment - 1) & ~(req.alignment - 1);
+                if (off + req.size > end) continue;
+                b.free.erase(it);
+                if (off > start) b.free[start] = off - start;
+                if (end > off + req.size) b.free[off + req.size] = end - (off + req.size);
+                return {static_cast<int>(i), off};
+            }
+        }
+        if (pass == 0 && !new_block(type)) break;
+    }
+    return {-1, 0};
+}
+
+void block_free(int block, VkDeviceSize off, VkDeviceSize size) {
+    auto& f = g_blocks[block].free;
+    auto next = f.lower_bound(off);
+    if (next != f.end() && off + size == next->first) {
+        size += next->second;
+        next = f.erase(next);
+    }
+    if (next != f.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == off) {
+            prev->second += size;
+            return;
+        }
+    }
+    f[off] = size;
+}
+
+// Blocks for the twins, made while the game loads: as many as a sixteenth of the GPU's
+// memory holds, at most 4, of the type a twin image needs.
+void make_blocks(VkDeviceSize heap) {
+    auto requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(device_fn("vkGetImageMemoryRequirements"));
+    auto destroy_image = reinterpret_cast<PFN_vkDestroyImage>(device_fn("vkDestroyImage"));
+    // not real_vkCreateImage: set only once the game fetches vkCreateImage, after this
+    auto create_image = reinterpret_cast<PFN_vkCreateImage>(device_fn("vkCreateImage"));
+    if (!requirements || !destroy_image || !create_image) return;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ci.extent = {192, 192, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage probe = VK_NULL_HANDLE;
+    if (create_image(g_device, &ci, nullptr, &probe) != VK_SUCCESS) return;
+    VkMemoryRequirements req;
+    requirements(g_device, probe, &req);
+    destroy_image(g_device, probe, nullptr);
+    uint32_t type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    unsigned want = static_cast<unsigned>(std::min<VkDeviceSize>(4, heap / 16 / kBlockBytes)), made = 0;
+    while (type != UINT32_MAX && made < want && new_block(type)) ++made;
+    logf("hd: %u blocks of %u MB for twin images", made, static_cast<unsigned>(kBlockBytes >> 20));
+}
+
 void free_hd(HdImage& hd) {
     auto destroy_view = reinterpret_cast<PFN_vkDestroyImageView>(device_fn("vkDestroyImageView"));
     auto destroy_image = reinterpret_cast<PFN_vkDestroyImage>(device_fn("vkDestroyImage"));
@@ -1471,6 +2297,7 @@ void free_hd(HdImage& hd) {
     if (hd.view && destroy_view) destroy_view(g_device, hd.view, nullptr);
     if (hd.image && destroy_image) destroy_image(g_device, hd.image, nullptr);
     if (hd.memory && free_memory) free_memory(g_device, hd.memory, nullptr);
+    if (hd.block >= 0) block_free(hd.block, hd.offset, hd.bytes);
     hd = HdImage{};
 }
 
@@ -1508,10 +2335,18 @@ HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = ii.format;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (ai.memoryTypeIndex == UINT32_MAX || allocate(g_device, &ai, nullptr, &hd.memory) != VK_SUCCESS ||
-        bind(g_device, hd.image, hd.memory, 0) != VK_SUCCESS ||
-        real_vkCreateImageView(g_device, &vi, nullptr, &hd.view) != VK_SUCCESS)
-        free_hd(hd);
+    auto [block, offset] = ai.memoryTypeIndex == UINT32_MAX ? std::make_pair(-1, VkDeviceSize{0})
+                                                             : block_alloc(req, ai.memoryTypeIndex);
+    bool bound;
+    if (block >= 0) {
+        hd.block = block;
+        hd.offset = offset;
+        bound = bind(g_device, hd.image, g_blocks[block].memory, offset) == VK_SUCCESS;
+    } else {
+        bound = ai.memoryTypeIndex != UINT32_MAX && allocate(g_device, &ai, nullptr, &hd.memory) == VK_SUCCESS &&
+                bind(g_device, hd.image, hd.memory, 0) == VK_SUCCESS;
+    }
+    if (!bound || real_vkCreateImageView(g_device, &vi, nullptr, &hd.view) != VK_SUCCESS) free_hd(hd);
     return hd;
 }
 
@@ -1557,6 +2392,23 @@ void maintain_twins() {
     }
 }
 
+// The HD wallpaper file for a wall upload (its pixels in g_name_buf), or "": the upload's
+// pixels under each known coverage mask of its size, hashed like content_name, tried in turn.
+std::string wall_file_name(const ImageInfo& ii, const std::vector<WallMask>& masks) {
+    const unsigned char* p = g_name_buf.data();
+    for (size_t m = 0; m < masks.size(); ++m) {
+        uint64_t h = 1469598103934665603ull;
+        for (auto [first, count] : masks[m])
+            for (const unsigned char *b = p + 4ull * first, *e = b + 4ull * count; b < e; ++b)
+                h = (h ^ *b) * 1099511628211ull;
+        char name[80];
+        snprintf(name, sizeof name, "%ux%u_%016llx_w%u", ii.w, ii.h, static_cast<unsigned long long>(h),
+                 static_cast<unsigned>(m));
+        if (g_hd_names.count(name)) return name;
+    }
+    return "";
+}
+
 // For each upload into a sampled texture: when its pixels have a replacement
 // file, record (into cb, after the game's own copy) the fill of an HD twin.
 void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
@@ -1569,8 +2421,18 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     std::string name;
     const ImageInfo* info = nullptr;
     bool depth = im->second.format == VK_FORMAT_R8_UNORM;  // a sprite's depth texture
-    if ((im->second.format == VK_FORMAT_B8G8R8A8_UNORM && g_hd_sizes.count({im->second.w, im->second.h})) ||
-        (depth && g_z_sizes.count({im->second.w, im->second.h})))
+    bool colour = im->second.format == VK_FORMAT_B8G8R8A8_UNORM;
+    auto wall = colour ? g_wall_masks.find({im->second.w, im->second.h}) : g_wall_masks.end();
+    bool wall_mask = depth && g_wall_masks.count({im->second.w, im->second.h});  // same size as its wall
+    if (wall != g_wall_masks.end() && n) {  // every upload into a wall-sized image, whole or not
+        static unsigned logged = 0;
+        if (logged++ < 300)
+            logf("wall upload: img#%u %ux%u, %u regions, first at (%d,%d) %ux%u row length %u, frame %u",
+                 im->second.id, im->second.w, im->second.h, n, r[0].imageOffset.x, r[0].imageOffset.y,
+                 r[0].imageExtent.width, r[0].imageExtent.height, r[0].bufferRowLength, g_frame);
+    }
+    if ((colour && (g_hd_sizes.count({im->second.w, im->second.h}) || wall != g_wall_masks.end())) ||
+        (depth && (g_z_sizes.count({im->second.w, im->second.h}) || wall_mask)))
         if (const unsigned char* p = upload_pixels(src, dst, n, r, &info)) {
             double t0 = now_ms();
             name = content_name(*info, p);
@@ -1582,7 +2444,7 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
         release_twin(existing->second.name);        // new pixels; the old twin may still be in flight
         g_hd.erase(existing);
     }
-    if (name.empty() || !g_hd_names.count(name)) return;
+    if (name.empty()) return;
     auto cached = g_twins.find(name);
     if (cached != g_twins.end()) {  // shown before (or by another image now): filled already
         acquire_twin(cached->second);
@@ -1590,19 +2452,52 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
         ++g_perf.reused;
         return;
     }
+    std::string file = name;  // the replacement file, without @scale
+    HdImage::Kind kind = HdImage::kFile;
+    if (!g_hd_names.count(name)) {
+        if (wall_mask) {  // no file: the upload magnified
+            file.clear();
+            kind = HdImage::kWallMask;
+        } else {
+            if (wall == g_wall_masks.end()) return;
+            // g_name_buf holds the upload (content_name). A wall with no HD wallpaper (a fence,
+            // custom content) gets the upload magnified, so its mask's twin, smooth-edged, can go
+            // with it (the two are only bound together)
+            file = g_no_wallpaper.count(name) ? std::string() : wall_file_name(*info, wall->second);
+            static unsigned logged = 0;
+            if (logged++ < 300)
+                logf("wall: img#%u %s -> %s", info->id, name.c_str(), file.empty() ? "no HD wallpaper: magnified" : file.c_str());
+            if (file.empty()) g_no_wallpaper.insert(name);
+            kind = HdImage::kWall;
+        }
+    }
     const ImageInfo& ii = *info;
-    Replacement rp{g_replace_dir + "\\" + name + "@" + std::to_string(g_layer_scale) + (depth ? ".raw" : ".bgra"),
+    Replacement rp{file.empty() ? std::string()
+                                : g_replace_dir + "\\" + file + "@" + std::to_string(g_layer_scale) +
+                                      (depth ? ".raw" : ".bgra"),
                    ii.w * g_layer_scale, ii.h * g_layer_scale, texel_size(ii.format)};
     auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(device_fn("vkCmdPipelineBarrier"));
     if (!barrier) return;
-    Staging st = load_staging(rp);
+    void* mapped = nullptr;
+    Staging st = twin_staging(1ull * rp.bpp * rp.w * rp.h, &mapped);
     if (!st.buffer) return;
-    g_staging_retire.push_back({st, g_frame});
+    if (kind == HdImage::kWallMask)
+        stair_coverage(static_cast<unsigned char*>(mapped), g_name_buf.data(), static_cast<int>(ii.w),
+                       static_cast<int>(ii.h), g_layer_scale);
+    else if (rp.path.empty())  // a wall without an HD wallpaper
+        magnify(static_cast<unsigned char*>(mapped), g_name_buf.data(), rp.w, rp.h, rp.bpp, g_layer_scale);
+    else {  // filled before the next submit (wait_files)
+        FileJob job{rp.path, static_cast<unsigned char*>(mapped), g_name_buf, rp.w, rp.h, rp.bpp, kind == HdImage::kWall};
+        auto packed = g_packed.find(rp.path.substr(g_replace_dir.size() + 1));
+        if (packed != g_packed.end()) job.packed = &packed->second;
+        queue_file(std::move(job));
+    }
     VkBuffer staged = st.buffer;
     double t0 = now_ms();
     HdImage hd = make_hd(ii, g_layer_scale, name);
     g_perf.image += now_ms() - t0;
     if (!hd.image) return;
+    hd.kind = kind;
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     b.srcAccessMask = 0;
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1613,6 +2508,7 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     VkBufferImageCopy reg{};
+    reg.bufferOffset = st.offset;
     reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     reg.imageExtent = {rp.w, rp.h, 1};
     real_vkCmdCopyBufferToImage(cb, staged, hd.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
@@ -1626,7 +2522,8 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     t.hd = hd;
     t.users = 1;
     static unsigned logged = 0;
-    if (logged++ < 100 || depth) logf("hd: img#%u %s -> %ux%u twin", ii.id, name.c_str(), rp.w, rp.h);
+    if (logged++ < 100 || (depth && kind == HdImage::kFile))
+        logf("hd: img#%u %s -> %ux%u twin%s", ii.id, name.c_str(), rp.w, rp.h, kind == HdImage::kWallMask ? " (magnified)" : "");
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
@@ -1805,6 +2702,12 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
         g_readback.clear();
         for (auto& t : g_twins) free_hd(t.second.hd);  // g_hd only points at these
         g_twins.clear();
+        free_staging(g_ring.st);
+        g_ring = Ring{};
+        auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(device_fn("vkFreeMemory"));
+        for (auto& b : g_blocks)
+            if (free_memory) free_memory(d, b.memory, nullptr);
+        g_blocks.clear();
         g_hd.clear();
         g_released.clear();
         g_idle.clear();
@@ -1821,16 +2724,50 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
         g_xbr_twin.clear();
         if (g_xbr_module && destroy_module) destroy_module(d, g_xbr_module, nullptr);
         g_xbr_module = VK_NULL_HANDLE;
+        for (auto& t : g_world_twin)
+            if (destroy_pipeline) destroy_pipeline(d, t.second, nullptr);
+        g_world_twin.clear();
+        for (auto& t : g_world_partial)
+            if (destroy_pipeline) destroy_pipeline(d, t.second, nullptr);
+        g_world_partial.clear();
+        for (auto& m : g_world_modules) {
+            if (m && destroy_module) destroy_module(d, m, nullptr);
+            m = VK_NULL_HANDLE;
+        }
         g_device = VK_NULL_HANDLE;
     }
     real_vkDestroyDevice(d, a);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
+    {
+        // a new recording starts with nothing bound: forget what the last one bound, so that
+        // flush_partial never binds a set or buffer that may be gone by now
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        CmdState& st = g_cmd[cb];
+        st.bound = 0;
+        st.in_pass = false;
+        st.set_calls.clear();
+        st.pushes.clear();
+        st.deferred.clear();
+        st.vbs.clear();
+        st.ib = 0;
+    }
+    return real_vkBeginCommandBuffer(cb, bi);
+}
+
+VKAPI_ATTR void VKAPI_CALL hk_vkCmdNextSubpass(VkCommandBuffer cb, VkSubpassContents sc) {
+    flush_partial(cb);  // its pipelines belong to this subpass
+    real_vkCmdNextSubpass(cb, sc);
+}
+
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderPass(VkCommandBuffer cb) {
+    flush_partial(cb);
     real_vkCmdEndRenderPass(cb);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     if (g_trace) logf("  [end]");
     CmdState& st = g_cmd[cb];
+    st.in_pass = false;
     if (st.scale > 1) {
         st.scale = 1;
         apply_dynamic_state(cb, st, 1);  // later passes expect the game's values
@@ -1849,6 +2786,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateSwapchainKHR(VkDevice d, const VkSwapc
             if (g_dpi_arg > 0) s = std::min(s, g_dpi_arg);
             g_layer_scale = std::min(s, 4);
         }
+        // the HD files' index, now that the scale is known (still on the loading screen)
+        if (!g_hd_scanned && g_replace_on && g_layer_scale >= 2) scan_hd_files();
     }
     logf("createSwapchain %ux%u fmt%d images>=%u (layer scale %d)", ci->imageExtent.width, ci->imageExtent.height,
          static_cast<int>(ci->imageFormat), ci->minImageCount, g_layer_scale);
@@ -1946,6 +2885,7 @@ void write_world_draws(VkCommandBuffer cb) {
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    wait_files();  // the staging buffers the submitted uploads copy from are filled
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         if (!g_draw_recs.empty())
@@ -2024,11 +2964,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
         }
     }
     g_perf = Perf{};
-    if (!g_staging_retire.empty()) free_retired_staging(false);
+    if (!g_staging_retire.empty() || !g_ring.live.empty()) free_retired_staging(false);
     maintain_twins();
     if (g_trace) {
         logf("== end of traced frame %u (%u xbr draws)", g_frame, g_xbr_draws);
-        g_trace = false;
+        g_trace = --g_trace_left > 0;
     }
     g_xbr_draws = 0;
     // Hotkeys only count while the game window has focus; automation uses the
@@ -2041,7 +2981,9 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
     bool hd_toggle = (GetAsyncKeyState(VK_F9) & 1) && focused;
     bool world = (GetAsyncKeyState(VK_F8) & 1) && focused;
     bool bench = (GetAsyncKeyState(VK_F7) & 1) && focused;
+    bool world_toggle = (GetAsyncKeyState(VK_F6) & 1) && focused;
     if (g_frame % 30 == 0) {
+        world_toggle = consume_trigger("world.toggle") || world_toggle;
         toggle = consume_trigger("xbr.toggle") || toggle;
         trace = consume_trigger("trace.now") || trace;
         hd_toggle = consume_trigger("hd.toggle") || hd_toggle;
@@ -2054,14 +2996,15 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
         logf("== benchmark: %u frames from frame %u", kBenchFrames, g_frame + 1);
     }
     if (g_world_now) {
-        g_world_now = false;
+        g_world_now = --g_world_left > 0;
         g_draw_recs.clear();  // anything recorded but never submitted
         logf("== world log of frame %u written (%u draws so far)", g_frame, g_world_seq);
     }
     if (world) {
         if (g_names_on) {
             g_world_now = true;
-            logf("== world log: recording frame %u", g_frame + 1);
+            g_world_left = kWorldFrames;
+            logf("== world log: recording frames %u to %u", g_frame + 1, g_frame + kWorldFrames);
         } else {
             logf("== world log needs VKPROXY_WORLDLOG=1 from game start (texture names)");
         }
@@ -2074,9 +3017,14 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
         g_hd_on = !g_hd_on;
         logf("== hd %s at frame %u", g_hd_on ? "on" : "off", g_frame);
     }
+    if (world_toggle) {
+        g_world_on = !g_world_on;
+        logf("== world shaders %s at frame %u", g_world_on ? "ours" : "the game's", g_frame);
+    }
     if (trace) {
         g_trace = true;
-        logf("== tracing frame %u", g_frame + 1);
+        g_trace_left = kTraceFrames;
+        logf("== tracing frames %u to %u", g_frame + 1, g_frame + kTraceFrames);
     }
     return r;
 }
@@ -2137,6 +3085,12 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateDevice(VkPhysicalDevice pd, const VkDe
         g_idle_max = std::min<uint32_t>(max_allocs / 2, 8192);
         logf("hd twins: idle budget %u MB, %u twins (GPU heap %u MB, at most %u allocations)",
              static_cast<unsigned>(g_twin_budget >> 20), g_idle_max, static_cast<unsigned>(heap >> 20), max_allocs);
+        if (g_replace_on) {  // while the game loads rather than when a lot needs them
+            std::lock_guard<std::recursive_mutex> lk(g_mu);
+            make_ring();
+            make_blocks(heap);
+        }
+        start_warmup();
     }
     return r;
 }

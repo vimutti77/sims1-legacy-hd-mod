@@ -336,20 +336,26 @@ class BuildTests(unittest.TestCase):
 
     def test_install_takes_ai_pictures_unless_drawn_or_rejected(self):
         work, game = self.hd_dir / "work", self.hd_dir / "game"
+        import hd_pack
+        p1, p2, p3 = (f"74x37_{i:016x}" for i in (1, 2, 3))
         (work / "hd").mkdir(parents=True)
         (work / "ai").mkdir()
-        for pic in ("p1", "p2", "p3"):
+        for pic in (p1, p2, p3):
             (work / "ai" / f"{pic}@3.bgra").write_bytes(b"ai")
-        (work / "hd" / "p1@3.bgra").write_bytes(b"drawn")
-        (work / "ai.txt").write_text("# painted icons\np1\np2\np3\n")
-        (work / "rejected.txt").write_text("p3\n")
-        rows = [dict(iff="x.iff", label="drawn", picture="p1", rmse_normal=1.0, rmse_selected=1.0, iou=1.0)]
+        (work / "hd" / f"{p1}@3.bgra").write_bytes(b"drawn")
+        (work / "ai.txt").write_text(f"# painted icons\n{p1}\n{p2}\n{p3}\n")
+        (work / "rejected.txt").write_text(f"{p3}\n")
+        rows = [dict(iff="x.iff", label="drawn", picture=p1, rmse_normal=1.0, rmse_selected=1.0, iou=1.0)]
         build.install(work, game, rows)
-        dest = game / "vkproxy" / "replace"
-        self.assertEqual((dest / "p1@3.bgra").read_bytes(), b"drawn")  # drawn from sprites wins
-        self.assertEqual((dest / "p2@3.bgra").read_bytes(), b"ai")
-        self.assertFalse((dest / "p3@3.bgra").exists())
-        self.assertEqual(build.read_list(work / "installed.txt"), {"p1", "p2"})
+        dest = hd_pack.Installed(game / "vkproxy" / "replace")
+        self.assertEqual(dest.loose, set())  # packed
+        self.assertEqual(dest.read(f"{p1}@3.bgra"), b"drawn")  # drawn from sprites wins
+        self.assertEqual(dest.read(f"{p2}@3.bgra"), b"ai")
+        self.assertNotIn(f"{p3}@3.bgra", dest)
+        self.assertEqual(build.read_list(work / "installed.txt"), {p1, p2})
+        (work / "ai.txt").write_text(f"{p2}\n")  # p1 no longer drawn either: taken out of the pack
+        build.install(work, game, [])
+        self.assertEqual(hd_pack.Installed(game / "vkproxy" / "replace").names(), {f"{p2}@3.bgra"})
 
     def test_ai_picture_halves(self):
         import ai_pictures

@@ -16,8 +16,10 @@ if (-not $cxx) {
 }
 if (-not $cxx) { throw "i686-w64-mingw32-clang++ not found (install MartinStorsjo.LLVM-MinGW.UCRT)" }
 
-& "$sdk\Bin\glslc.exe" -O -mfmt=c -o "$out\xbr_frag.inc" "$root\src\xbr.frag"
-if ($LASTEXITCODE -ne 0) { throw "shader compile failed" }
+foreach ($shader in 'xbr', 'world_floor', 'world_wall', 'world_object', 'world_object_yiq') {
+    & "$sdk\Bin\glslc.exe" -O -mfmt=c -o "$out\${shader}_frag.inc" "$root\src\$shader.frag"
+    if ($LASTEXITCODE -ne 0) { throw "shader compile failed: $shader.frag" }
+}
 
 & $cxx -std=c++17 -O2 -Wall -shared -static -o "$out\vulkan-1.dll" "$root\src\vkproxy.cpp" `
     "-I$sdk\Include" "-I$out" '-Wl,--kill-at'

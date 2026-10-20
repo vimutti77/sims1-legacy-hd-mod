@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+import hd_pack
 import objects
 import spr2
 
@@ -42,6 +43,16 @@ LIFT_PX = 16  # and that many screen pixels (near zoom) higher per unit of DGRP 
 TILE_STEP_Y = 32  # screen y (near zoom) of one tile step
 MIN_ALPHA = 0.25
 SCALE = 3  # HD sprites are 3x
+
+
+_installed: dict = {}  # folder -> hd_pack.Installed, read once per process
+
+
+def installed(folder: Path) -> hd_pack.Installed:
+    """The HD files in a folder (loose or packed), indexed once."""
+    if folder not in _installed:
+        _installed[folder] = hd_pack.Installed(folder)
+    return _installed[folder]
 
 
 class Sprites:
@@ -76,10 +87,10 @@ class Sprites:
             self._hd[key] = None
             if self.original(sid, frame) is not None and self.hd_dir is not None:
                 rgba, _z, _hx, _hy, name = self._orig[key]
-                p = self.hd_dir / f"{name}@{SCALE}.bgra"
+                files, file = installed(self.hd_dir), f"{name}@{SCALE}.bgra"
                 h, w = rgba.shape[0] * SCALE, rgba.shape[1] * SCALE
-                if p.exists() and p.stat().st_size == w * h * 4:
-                    tex = np.frombuffer(p.read_bytes(), np.uint8).reshape(h, w, 4)
+                if files.size(file) == w * h * 4:
+                    tex = np.frombuffer(files.read(file), np.uint8).reshape(h, w, 4)
                     self._hd[key] = tex[..., [2, 1, 0, 3]].astype(np.float32) / 255
         return self._hd[key]
 

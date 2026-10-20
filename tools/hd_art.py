@@ -21,7 +21,7 @@ A part is a category of objects within a pack:
 Floors (GameData/floors.iff, GameData/Floors/*.flr and the .flr files in the packs'
 archives) are SPR2 diamonds the game lays edge to edge: their input is filled with the
 neighbouring tiles instead of a mirror image (hd_composite.tile_fill), so no seam shows
-between tiles.
+between tiles, and installed with their outline smoothed (tools/hd_floors.py).
 
 Touched up by hand: <work>/edits/<name>.png (the HD texture as straight RGBA, 3x the
 sprite or any whole multiple of that) is installed instead of the built texture: its
@@ -51,6 +51,7 @@ from pathlib import Path
 
 import far
 import hd_composite
+import hd_floors
 import hd_pack
 import iff
 import spr2
@@ -441,8 +442,12 @@ def main(argv: list[str]) -> int:
             installed = dest.mtime(f"{name}@3.bgra")
             if newest is None or (installed is not None and installed >= newest):
                 continue
+            w, h = hd_composite.size_of(name)
+            tex = (orig / f"{name}.bgra").read_bytes() if name in floors else b""
             if edit.exists() and src.exists():  # touched up by hand
                 install_edit(name, src, edit, dest, depths)
+            elif src.exists() and name in floors and hd_floors.is_tile(w, h, tex):  # outline smoothed
+                dest.write(f"{name}@3.bgra", hd_floors.edges(w, h, tex, src.read_bytes()))
             elif src.exists():
                 dest.copy(src, f"{name}@3.bgra")
             else:

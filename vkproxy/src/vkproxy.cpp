@@ -71,17 +71,22 @@ const uint32_t kWorldObjectFrag[] =
 const uint32_t kWorldObjectYiqFrag[] =
 #include "world_object_yiq_frag.inc"
     ;
+const uint32_t kWorldWallTopFrag[] =
+#include "world_wall_top_frag.inc"
+    ;
 struct WorldShader {
     const char* game;  // the game's fragment shader it replaces
     const uint32_t* code;
     size_t size;
     bool split;  // drawn in two parts: opaque pixels, then the partly covered ones (g_world_partial)
 };
+const int kWorldFloor = 0;  // kWorldShaders index of the floor tiles' shader
 const WorldShader kWorldShaders[] = {
-    {"shader_63b9db14d8318909.spv", kWorldFloorFrag, sizeof kWorldFloorFrag, false},         // floors, wall tops
+    {"shader_63b9db14d8318909.spv", kWorldFloorFrag, sizeof kWorldFloorFrag, true},          // floors, wall tops
     {"shader_dfa0d8fccf7ee369.spv", kWorldWallFrag, sizeof kWorldWallFrag, false},           // walls
     {"shader_b2e55b6e3b04a39c.spv", kWorldObjectFrag, sizeof kWorldObjectFrag, true},        // objects
     {"shader_c616498e50bad3d1.spv", kWorldObjectYiqFrag, sizeof kWorldObjectYiqFrag, true},  // objects, brightened
+    {"shader_ccd02c43ced1b15e.spv", kWorldWallTopFrag, sizeof kWorldWallTopFrag, false},     // wall tops, walls down
 };
 
 std::recursive_mutex g_mu;
@@ -291,7 +296,8 @@ struct DrawArgs {
 // An object draw's partly covered pixels, drawn again at the end of the pass (see g_world_partial).
 struct Deferred {
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkPipelineLayout layout[2] = {};
+    VkPipelineLayout layout = VK_NULL_HANDLE;  // the pipeline's: sets and push constants go with it
+    uint32_t sets = 0;                         // how many of set[] its shader uses
     VkDescriptorSet set[2] = {};
     std::vector<PushRec> pushes;
     std::vector<std::pair<uint64_t, VkDeviceSize>> vbs;
@@ -325,7 +331,8 @@ struct CmdState {
     unsigned seq = 0;
     std::vector<std::shared_ptr<SetCall>> set_calls;  // per set index: the call that last bound it
     std::vector<PushRec> pushes;                      // the last push for each set of stages
-    std::vector<Deferred> deferred;
+    std::vector<Deferred> deferred;        // objects': drawn at the end of the pass
+    std::vector<Deferred> deferred_floor;  // floor tiles': before the next wall or object draw
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -343,9 +350,16 @@ std::unordered_map<uint64_t, VkPipeline> g_world_twin;      // game pipeline -> 
 // the one behind it: the front piece's edge then blends with the floor, and its depth keeps the
 // piece behind from filling in (light dots along the edge, for as long as that order lasts).
 // So a split object pipeline's twin draws only the opaque pixels, and every such draw is
-// repeated at the end of its render pass with this pipeline (no depth writes) for the partly
-// covered ones, which then blend over everything opaque behind them, whatever the order.
+// repeated at the end of its render pass with this pipeline for the partly covered ones, which
+// then blend over everything opaque behind them, whatever the order. They still write depth:
+// without it a chair behind a table, its legs' edges repeated after the table's, showed through
+// the table's edge and the flowers on it.
 std::unordered_map<uint64_t, VkPipeline> g_world_partial;  // game pipeline -> partly covered pixels' twin
+// Floor tiles likewise (tools/hd_floors.py: the partly covered pixels of their straightened
+// outline lie outside their own), but repeated once the floor tiles are drawn, before the
+// first wall or object: drawn later, they would win ties with the bottom rows of walls.
+std::unordered_map<uint64_t, int> g_world_kind;  // game pipeline -> its kWorldShaders index
+std::unordered_map<uint64_t, uint64_t> g_world_layout;  // game pipeline (with a world twin) -> its layout
 VkShaderModule g_world_modules[std::size(kWorldShaders)] = {};
 std::unordered_map<VkCommandBuffer, CmdState> g_cmd;
 std::unordered_map<uint64_t, Replacement> g_replace;        // VkImage -> replacement pixels
@@ -805,7 +819,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
                 for (int k = 0; k < 3; ++k) spec[k] = {1, &entry, sizeof(int32_t), &kPasses[k]};
                 VkPipeline twin = VK_NULL_HANDLE, partial = VK_NULL_HANDLE;
                 if (own_module(d, ws.code, ws.size, &g_world_modules[world])) {
-                    if (ws.split) partial = make_twin(d, c, ci[i], g_world_modules[world], &spec[2], true);
+                    // floor tiles' partly covered pixels lie on the next tile (same depth): no depth writes,
+                    // or the walls drawn next would lose ties along their bottom row; objects' do write,
+                    // so that among the repeated draws the pieces in front still hide those behind
+                    if (ws.split)
+                        partial = make_twin(d, c, ci[i], g_world_modules[world], &spec[2], world == kWorldFloor);
                     twin = make_twin(d, c, ci[i], g_world_modules[world], ws.split ? &spec[partial ? 1 : 0] : nullptr);
                     if (partial && !twin) {
                         auto destroy = reinterpret_cast<PFN_vkDestroyPipeline>(real_GDPA(d, "vkDestroyPipeline"));
@@ -815,6 +833,8 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, VkPipeli
                 }
                 if (twin) g_world_twin[(uint64_t)out[i]] = twin;
                 if (partial) g_world_partial[(uint64_t)out[i]] = partial;
+                g_world_kind[(uint64_t)out[i]] = world;
+                g_world_layout[(uint64_t)out[i]] = (uint64_t)ci[i].layout;
                 logf("  world twin for pipe#%u (%s): %s%s", id, ws.game, twin ? "ok" : "FAILED",
                      ws.split ? (partial ? ", split" : ", NOT split") : "");
             }
@@ -927,6 +947,7 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkR
     st.area = big.renderArea;
     st.in_pass = true;
     st.deferred.clear();
+    st.deferred_floor.clear();
     if (scale > 1) apply_dynamic_state(cb, st, scale);
 }
 
@@ -1150,21 +1171,27 @@ void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
     auto partial = g_world_partial.find(st.pipeline);
     auto twin = g_world_twin.find(st.pipeline);
     if (partial == g_world_partial.end() || twin == g_world_twin.end() || st.bound != (uint64_t)twin->second) return;
+    auto kind = g_world_kind.find(st.pipeline);
+    auto layout = g_world_layout.find(st.pipeline);
+    if (kind == g_world_kind.end() || layout == g_world_layout.end()) return;
+    static unsigned warned = 0;
     Deferred d;
     d.pipeline = partial->second;
-    for (size_t s = 0; s < HdBind::kSets; ++s) {
-        if (hb.ours[s]) {
-            d.set[s] = hb.ours[s];
-            d.layout[s] = hb.layout[s];
-        } else if (s < st.sets.size() && s < st.set_layouts.size()) {
-            d.set[s] = (VkDescriptorSet)st.sets[s];
-            d.layout[s] = (VkPipelineLayout)st.set_layouts[s];
-        }
-        // the object shaders' sets hold one texture each; one with dynamic offsets is not ours to repeat
+    d.layout = (VkPipelineLayout)layout->second;
+    d.sets = kind->second == kWorldFloor ? 1 : 2;  // floors: the texture; objects: texture and depth
+    for (size_t s = 0; s < d.sets; ++s) {
+        d.set[s] = hb.ours[s] ? hb.ours[s] : s < st.sets.size() ? (VkDescriptorSet)st.sets[s] : VK_NULL_HANDLE;
+        // these sets hold one texture each; one with dynamic offsets is not ours to repeat
         bool dyn = s < st.set_calls.size() && st.set_calls[s] && !st.set_calls[s]->dyn.empty();
-        if (!d.set[s] || !d.layout[s] || dyn) return;
+        if (!d.set[s] || dyn) {
+            if (warned++ < 20) logf("WARNING partly covered pixels of a draw not repeated (set %zu)", s);
+            return;
+        }
     }
-    d.pushes = st.pushes;
+    // the push constants as pushed with this layout (others belong to other pipelines)
+    for (auto& p : st.pushes)
+        if (p.layout == layout->second) d.pushes.push_back(p);
+    if (d.pushes.empty() && warned++ < 20) logf("WARNING a repeated draw has no push constants of its layout");
     d.vbs = st.vbs;
     d.ib = st.ib;
     d.ib_off = st.ib_off;
@@ -1172,7 +1199,7 @@ void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
     d.args = args;
     d.viewports = st.viewports;
     d.scissors = st.scissors;
-    st.deferred.push_back(std::move(d));
+    (kind->second == kWorldFloor ? st.deferred_floor : st.deferred).push_back(std::move(d));
 }
 
 void issue_pushes(VkCommandBuffer cb, std::vector<PushRec> pushes) {
@@ -1201,20 +1228,20 @@ void issue_dynamic_state(VkCommandBuffer cb, const std::vector<VkViewport>& vp, 
     if (!r.empty()) real_vkCmdSetScissor(cb, 0, static_cast<uint32_t>(r.size()), r.data());
 }
 
-// Before the render pass ends: the deferred draws' partly covered pixels, in the game's order,
-// then the game's state as it was.
-void flush_partial(VkCommandBuffer cb) {
+// The deferred draws' partly covered pixels (st.deferred or st.deferred_floor), in the game's
+// order, then the game's state as it was.
+void flush_partial(VkCommandBuffer cb, bool floors) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     CmdState& st = g_cmd[cb];
-    if (st.deferred.empty()) return;
-    if (g_trace) logf("    [partly covered pixels of %zu object draws]", st.deferred.size());
+    std::vector<Deferred>& list = floors ? st.deferred_floor : st.deferred;
+    if (list.empty()) return;
+    if (g_trace) logf("    [partly covered pixels of %zu %s draws]", list.size(), floors ? "floor" : "object");
     VkPipeline pipeline = VK_NULL_HANDLE;
     const std::vector<VkViewport>* vp = &st.viewports;
     const std::vector<VkRect2D>* sc = &st.scissors;
-    for (auto& d : st.deferred) {
+    for (auto& d : list) {
         if (d.pipeline != pipeline) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline = d.pipeline);
-        for (uint32_t s = 0; s < HdBind::kSets; ++s)
-            real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout[s], s, 1, &d.set[s], 0, nullptr);
+        real_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout, 0, d.sets, d.set, 0, nullptr);
         issue_pushes(cb, d.pushes);
         issue_buffers(cb, d.vbs, d.args.indexed ? d.ib : 0, d.ib_off, d.ib_type);
         if (d.viewports.size() != vp->size() || d.scissors.size() != sc->size() ||
@@ -1232,7 +1259,7 @@ void flush_partial(VkCommandBuffer cb) {
         else
             real_vkCmdDraw(cb, a.count, a.instances, a.first, a.first_instance);
     }
-    st.deferred.clear();
+    list.clear();
     // the game's state again: pipeline, sets (their binding calls in the game's order), push
     // constants, buffers, viewports and scissors
     if (st.bound) real_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)st.bound);
@@ -1254,6 +1281,13 @@ void flush_partial(VkCommandBuffer cb) {
 template <typename F>
 void substituted_draw(VkCommandBuffer cb, const char* kind, const DrawArgs& args, F draw) {
     const uint32_t count = args.count;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        CmdState& st = g_cmd[cb];
+        auto world = g_world_kind.find(st.pipeline);  // a wall or object: the floor tiles are done
+        if (!st.deferred_floor.empty() && world != g_world_kind.end() && world->second != kWorldFloor)
+            flush_partial(cb, true);
+    }
     struct Timed {  // the proxy's time around each draw, while benchmarking
         double t0 = g_bench ? now_ms() : 0;
         bool hd = false, xbr = false;
@@ -2730,6 +2764,8 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
         for (auto& t : g_world_partial)
             if (destroy_pipeline) destroy_pipeline(d, t.second, nullptr);
         g_world_partial.clear();
+        g_world_kind.clear();
+        g_world_layout.clear();
         for (auto& m : g_world_modules) {
             if (m && destroy_module) destroy_module(d, m, nullptr);
             m = VK_NULL_HANDLE;
@@ -2750,6 +2786,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb, const
         st.set_calls.clear();
         st.pushes.clear();
         st.deferred.clear();
+        st.deferred_floor.clear();
         st.vbs.clear();
         st.ib = 0;
     }
@@ -2757,12 +2794,14 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb, const
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdNextSubpass(VkCommandBuffer cb, VkSubpassContents sc) {
-    flush_partial(cb);  // its pipelines belong to this subpass
+    flush_partial(cb, true);  // their pipelines belong to this subpass
+    flush_partial(cb, false);
     real_vkCmdNextSubpass(cb, sc);
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderPass(VkCommandBuffer cb) {
-    flush_partial(cb);
+    flush_partial(cb, true);
+    flush_partial(cb, false);
     real_vkCmdEndRenderPass(cb);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     if (g_trace) logf("  [end]");

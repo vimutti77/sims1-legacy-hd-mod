@@ -13,7 +13,7 @@ layout(location = 0) out vec4 colour;
 const float kShift = 0.1;
 // Which pixels this pipeline draws (vkproxy.cpp, g_world_partial): 0 all; 1 the opaque ones,
 // with the game's depth writes; 2 the partly covered ones, after every opaque one of the pass
-// and without depth writes. Drawn in the game's order instead, an edge pixel of an object in
+// (in the game's order, writing depth too). Drawn in the game's order instead, an edge pixel of an object in
 // front blended with the floor and its depth then kept out the object behind, drawn later: a
 // line of light dots along the edge, there for as long as the game kept that order.
 layout(constant_id = 0) const int kPass = 0;

@@ -28,6 +28,14 @@ layout(location = 0) out vec4 colour;
 
 const float kShift = 0.1;
 const float kAddedBehind = 0.0005;  // see world_wall.frag
+// Floor tiles (odd widths; wall tops are even) from tools/hd_floors.py have their own pixels
+// opaque and, outside them, the partly covered pixels of their straightened outline. Which this
+// pipeline draws (vkproxy.cpp, g_world_partial): 0 all; 1 the opaque ones, as the game draws
+// a tile; 2 the partly covered ones, once every floor tile is drawn (before the walls), without
+// depth writes and a hair in front, so that they win the tie with the tile next to them, on
+// the same plane, and blend over its stair-stepped teeth.
+layout(constant_id = 0) const int kPass = 0;
+const float kFringeAhead = 0.00001;
 
 float snap(float r) {
     float a = exp2(round(log2(r)));
@@ -46,6 +54,11 @@ void main() {
     if (any(lessThan(texel, vec2(0.0))) || any(greaterThanEqual(texel, size))) discard;
     vec4 t = texelFetch(tex, ivec2(texel), 0);
     if (t.w <= 0.0) discard;
+    float a = floor(t.w * 255.0 + 0.5);
+    bool tile = (int(size.x) & 1) == 1;
+    bool fringe = tile && a < 255.0;
+    if (kPass == 1 && fringe) discard;
+    if (kPass == 2 && !fringe) discard;
     vec3 d0 = world_pos - light0.xyz;
     float range = pc.light.y - pc.light.x;
     float f0 = 1.0 - pow(clamp((dot(d0, d0) - pc.light.x) / range, 0.0, 1.0), pc.light.z);
@@ -56,6 +69,8 @@ void main() {
     // HD wall tops (tools/hd_walls.py) mark the pixels their straight edges add outside the game's
     // coverage with an even alpha (the game's own are 0 or 255): pushed a little back, as in
     // world_wall.frag, so they lose near ties against objects at the wall
-    float a = floor(t.w * 255.0 + 0.5);
-    gl_FragDepth = depth.x + (a < 255.0 && mod(a, 2.0) == 0.0 ? kAddedBehind : 0.0);
+    if (fringe)
+        gl_FragDepth = depth.x - kFringeAhead;
+    else
+        gl_FragDepth = depth.x + (!tile && a < 255.0 && mod(a, 2.0) == 0.0 ? kAddedBehind : 0.0);
 }

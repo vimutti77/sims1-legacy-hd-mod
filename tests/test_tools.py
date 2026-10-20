@@ -2,6 +2,7 @@
 
 Run:  python -m unittest discover -s tests
 """
+import math
 import struct
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import font_atlas  # noqa: E402
 import iff  # noqa: E402
 import hd_art  # noqa: E402
 import hd_composite  # noqa: E402
+import hd_floors  # noqa: E402
 import hd_pack  # noqa: E402
 import hd_shapes  # noqa: E402
 import hd_ui  # noqa: E402
@@ -566,6 +568,73 @@ class StairsTests(unittest.TestCase):
         inv = bytes(1 - v for v in m)
         a, b = stairs.upscale(m, self.W, self.H), stairs.upscale(inv, self.W, self.H)
         self.assertTrue(all(abs(x + y - 255) <= 16 for x, y in zip(a, b)))
+
+
+class HdFloorsTests(unittest.TestCase):
+    W, H = 31, 16  # a floor diamond: w = 2h - 1, the next tile ((w + 1) / 2, h / 2) away
+    A, B = 16, 8
+
+    def owner(self, x: int, y: int) -> tuple[int, int]:
+        """Which tile of the floor (lattice (A, B), (A, -B)) a 1x pixel belongs to."""
+        dx, dy = (x + 0.5 - self.W / 2) / self.A, (y + 0.5 - self.H / 2) / self.B
+        return math.floor((dx + dy) / 2 + 0.5), math.floor((dx - dy) / 2 + 0.5)
+
+    def tile(self, bgr: tuple[int, int, int]) -> tuple[bytes, bytes]:
+        """A one-colour tile, 1x and nearest 3x (as an HD tile's own pixels are)."""
+        tex = b"".join(bytes(bgr) + b"\xff" if self.owner(x, y) == (0, 0) else b"\0\0\0\0"
+                       for y in range(self.H) for x in range(self.W))
+        W3 = self.W * 3
+        hd = b"".join(tex[((Y // 3) * self.W + X // 3) * 4:][:4] for Y in range(self.H * 3) for X in range(W3))
+        return tex, hd
+
+    def test_own_pixels_kept_and_outline_pixels_added_outside(self):
+        tex, hd = self.tile((0, 0, 200))
+        self.assertTrue(hd_floors.is_tile(self.W, self.H, tex))
+        out = hd_floors.edges(self.W, self.H, tex, hd)
+        W3 = self.W * 3
+        added = 0
+        for Y in range(self.H * 3):
+            for X in range(W3):
+                i = (Y * W3 + X) * 4
+                if tex[((Y // 3) * self.W + X // 3) * 4 + 3]:
+                    self.assertEqual(out[i:i + 4], hd[i:i + 4])
+                elif out[i + 3]:
+                    added += 1
+                    self.assertTrue(1 <= out[i + 3] <= 254)
+                    self.assertLessEqual(abs(out[i + 2] - 200 * out[i + 3] / 255), 1)  # premultiplied red
+                    self.assertEqual(out[i:i + 2], b"\0\0")
+        self.assertGreater(added, 0)
+        self.assertEqual(hd_floors.edges(self.W, self.H, tex, out), out)  # again: the same
+
+    def test_two_floors_meet_on_a_straight_line(self):
+        """Tile 1 (red) and tile 2 (blue) one tile apart along (A, B): each tile's own pixels, then
+        their added pixels blended over, as vkproxy draws them; the edge between them is straight."""
+        (t1, h1), (t2, h2) = self.tile((0, 0, 255)), self.tile((255, 0, 0))
+        e1, e2 = hd_floors.edges(self.W, self.H, t1, h1), hd_floors.edges(self.W, self.H, t2, h2)
+        W3, H3 = self.W * 3, self.H * 3
+        cw, ch = W3 + self.A * 3, H3 + self.B * 3
+        canvas = [[None] * cw for _ in range(ch)]
+        placed = ((e1, 0, 0), (e2, self.A * 3, self.B * 3))
+        for fringe in (False, True):
+            for img, ox, oy in placed:
+                for Y in range(H3):
+                    for X in range(W3):
+                        p = img[(Y * W3 + X) * 4:][:4]
+                        if (p[3] == 255) == fringe or not p[3]:
+                            continue
+                        under = canvas[Y + oy][X + ox]
+                        if fringe and under is None:
+                            continue
+                        a = p[3] / 255
+                        canvas[Y + oy][X + ox] = [p[k] + (under[k] * (1 - a) if fringe else 0) for k in range(3)]
+
+        def crossing(x: int) -> int:  # the last row down the column that is mostly red
+            return max(y for y in range(ch) if canvas[y][x] is not None and canvas[y][x][2] > canvas[y][x][0])
+
+        # the shared edge runs from tile 1's right corner down-left to its bottom corner
+        xs = range(W3 // 2 + 9, W3 - 9, 2)
+        steps = [crossing(x + 2) - crossing(x) for x in xs]
+        self.assertTrue(all(s == -1 for s in steps), steps)
 
 
 class HdUiTests(unittest.TestCase):

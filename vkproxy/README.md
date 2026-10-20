@@ -49,11 +49,18 @@ instead of the system loader. It forwards every call to the real loader
   between floors and along wall tops. Ours sample floors on the exact texel lattice and
   every sprite a tenth of a pixel right of and below the pixel centre. The object twins
   draw only opaque pixels; each such draw is repeated just before `vkCmdEndRenderPass`
-  without depth writes for the partly covered edge pixels, then the game's state is
-  restored. The game's object order changes from frame to frame and sometimes puts a
+  for the partly covered edge pixels (in the game's order, still writing depth), then
+  the game's state is restored. The game's object order changes from frame to frame and sometimes puts a
   piece in front before the one behind it, and an edge pixel drawn then blended with
-  the floor and kept the piece behind out (light dots along the edge). **F6** (or
-  `world.toggle`) switches back to the game's shaders.
+  the floor and kept the piece behind out (light dots along the edge). Floor tiles are
+  split the same way (`tools/hd_floors.py` adds the partly covered pixels of their
+  straightened outline outside their own), their partly covered pixels repeated before
+  the first wall or object draw, without depth writes and a hair in front so they blend
+  over the next tile's stair-stepped teeth. The wall tops drawn with the walls down or
+  cut away (their own shader picks one of eight depths per texel from a second texture)
+  give the pixels the HD wall tops add the farthest depth of the covered texels around
+  them, pushed back a little. **F6** (or `world.toggle`) switches back to the game's
+  shaders.
 - depth twins: each object sprite comes with a 1x depth texture (R8: the sprite's z, 0
   where it has no pixel, i.e. nearest). For a sprite whose HD coverage grows past the
   original (an outline rounded off by hand, `hd_art.py --install-edits`), a 3x depth

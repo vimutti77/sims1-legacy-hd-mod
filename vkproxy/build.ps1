@@ -16,7 +16,7 @@ if (-not $cxx) {
 }
 if (-not $cxx) { throw "i686-w64-mingw32-clang++ not found (install MartinStorsjo.LLVM-MinGW.UCRT)" }
 
-foreach ($shader in 'xbr', 'world_floor', 'world_wall', 'world_object', 'world_object_yiq') {
+foreach ($shader in 'xbr', 'world_floor', 'world_wall', 'world_object', 'world_object_yiq', 'world_wall_top') {
     & "$sdk\Bin\glslc.exe" -O -mfmt=c -o "$out\${shader}_frag.inc" "$root\src\$shader.frag"
     if ($LASTEXITCODE -ne 0) { throw "shader compile failed: $shader.frag" }
 }

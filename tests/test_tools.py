@@ -29,6 +29,7 @@ import hd_ui  # noqa: E402
 import stairs  # noqa: E402
 import hd_walls  # noqa: E402
 import inventory  # noqa: E402
+import skn  # noqa: E402
 import spr1  # noqa: E402
 import spr2  # noqa: E402
 
@@ -830,6 +831,52 @@ class IffTests(unittest.TestCase):
         struct.pack_into(">I", data, 64 + 4, 9999)
         with self.assertRaises(iff.IffError):
             iff.read_iff(bytes(data))
+
+
+class StrSetTests(unittest.TestCase):
+    def test_formats(self):
+        self.assertEqual(iff.str_set(struct.pack("<hH", 0, 2) + b"\x02ab\x01c"), ["ab", "c"])
+        self.assertEqual(iff.str_set(struct.pack("<hH", -1, 2) + b"ab\0c\0"), ["ab", "c"])
+        self.assertEqual(iff.str_set(struct.pack("<hH", -2, 1) + b"ab\0note\0"), ["ab"])
+        self.assertEqual(iff.str_set(struct.pack("<hH", -3, 2) + b"\x01adult\0\0\x01c802fa_x,HEAD-HEAD=c802falgt_x\0x\0"),
+                         ["adult", "c802fa_x,HEAD-HEAD=c802falgt_x"])
+        # -4: language sets; lengths 7-bit encoded (200 = 0xC8 0x01)
+        long = "x" * 200
+        body = struct.pack("<hBH", -4, 1, 2) + b"\x01\x02ab\x00" + b"\x01\xc8\x01" + long.encode() + b"\x00"
+        self.assertEqual(iff.str_set(body), ["ab", long])
+        with self.assertRaises(iff.IffError):
+            iff.str_set(struct.pack("<hH", -3, 2) + b"\x01ab\0")  # truncated
+        with self.assertRaises(iff.IffError):
+            iff.str_set(struct.pack("<hH", 1792, 0))
+
+
+class SknTests(unittest.TestCase):
+    TEXT = ("xskin-test-HEAD-HEAD\ntest\n1\nHEAD\n1\n0 1 2\n1\n0 0 3 -1 0\n3\n0 0\n1 0\n0 1\n0\n3\n"
+            "0 0 0 0 0 1\n0 1 0 0 0 1\n1 0 0 0 0 1\n")
+
+    def bmf(self, vertices=3):
+        def s(t):
+            return bytes([len(t)]) + t.encode()
+        return (s("xskin-test-HEAD-HEAD") + s("test") + struct.pack("<i", 1) + s("HEAD")
+                + struct.pack("<i3i", 1, 0, 1, 2) + struct.pack("<i5i", 1, 0, 0, 3, -1, 0)
+                + struct.pack("<i6f", 3, 0, 0, 1, 0, 0, 1) + struct.pack("<i", 0)
+                + struct.pack("<i", vertices) + struct.pack("<18f", 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1,
+                                                            1, 0, 0, 0, 0, 1)[:24 * vertices])
+
+    def test_text_and_binary_agree(self):
+        a, b = skn.read_skn(self.TEXT), skn.read_bmf(self.bmf())
+        self.assertEqual(a, b)
+        self.assertEqual((a.name, a.texture, a.bones, a.faces), ("xskin-test-HEAD-HEAD", "test", ["HEAD"], [(0, 1, 2)]))
+        self.assertEqual(a.vertices[1], (0, 1, 0, 0, 0, 1))
+        self.assertEqual(skn.read_skin("x.skn", self.TEXT.replace("\n", "\r\n").encode()), a)
+
+    def test_rejects_bad_meshes(self):
+        with self.assertRaises(skn.SkinError):
+            skn.read_bmf(self.bmf()[:-4])
+        with self.assertRaises(skn.SkinError):
+            skn.read_bmf(self.bmf() + b"\0")
+        with self.assertRaises(skn.SkinError):  # a face past the vertices
+            skn.read_skn(self.TEXT.replace("0 1 2", "0 1 3"))
 
 
 class ExeDumpTests(unittest.TestCase):

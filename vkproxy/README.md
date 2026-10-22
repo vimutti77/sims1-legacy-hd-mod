@@ -78,6 +78,14 @@ instead of the system loader. It forwards every call to the real loader
   the twins of the textures listed in `<replace>/mesh.names` (`tools/hd_skins.py`) get
   mipmaps (linear blits when the twin is made) and are drawn with a trilinear copy of the
   game's sampler; a 3x texture shown smaller than itself would shimmer otherwise.
+- portraits: the Sims' portraits are pictures stored in the character files, drawn again
+  at 3x by `portraits/redraw.py`. A Sim made or changed while playing brings new ones, so
+  `<replace>/portraits.auto` (written by the builder) names their sizes, which are looked up
+  on disk when they have no file (a loose file written since the game started is taken),
+  and the builder's command line, which the proxy starts in the background at low priority
+  (output in `portraits.log`) when it sees control panel faces (105x41) it has no file for,
+  once per such picture a session. The new pictures show the next time the game uploads
+  them (the next lot).
 - depth twins: each object sprite comes with a 1x depth texture (R8: the sprite's z, 0
   where it has no pixel, i.e. nearest). For a sprite whose HD coverage grows past the
   original (an outline rounded off by hand, `hd_art.py --install-edits`), a 3x depth

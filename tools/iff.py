@@ -57,6 +57,68 @@ def read_iff(data: bytes) -> list[IffChunk]:
     return chunks
 
 
+def str_set(body: bytes) -> list[str]:
+    """The strings of a STR# chunk (its first language's), formats 0 (Pascal strings),
+    -1 (C strings), -2 (C string pairs: value, comment), -3 (language byte, value,
+    comment as C strings) and -4 (language sets of language byte + value + comment, the
+    strings' lengths 7-bit encoded)."""
+    try:
+        (fmt,) = struct.unpack_from("<h", body, 0)
+        out = []
+        if fmt == -4:
+            pos = 3  # the first language set
+            (count,) = struct.unpack_from("<H", body, pos)
+            pos += 2
+
+            def string() -> str:
+                nonlocal pos
+                n = shift = 0
+                while True:
+                    b = body[pos]
+                    pos += 1
+                    n |= (b & 0x7F) << shift
+                    shift += 7
+                    if not b & 0x80:
+                        break
+                s = body[pos:pos + n].decode("latin-1")
+                pos += n
+                return s
+
+            for _ in range(count):
+                pos += 1  # language
+                out.append(string())
+                string()  # comment
+            return out
+        if fmt not in (0, -1, -2, -3):
+            raise IffError(f"unknown STR# format {fmt}")
+        (count,) = struct.unpack_from("<H", body, 2)
+        pos = 4
+
+        def cstring() -> str:
+            nonlocal pos
+            end = body.index(b"\0", pos)
+            s = body[pos:end].decode("latin-1")
+            pos = end + 1
+            return s
+
+        for _ in range(count):
+            if fmt == 0:
+                n = body[pos]
+                out.append(body[pos + 1:pos + 1 + n].decode("latin-1"))
+                pos += 1 + n
+            else:
+                if fmt == -3:
+                    pos += 1  # language
+                out.append(cstring())
+                if fmt != -1:
+                    cstring()  # comment
+        return out
+    except (struct.error, IndexError, ValueError) as e:
+        if isinstance(e, IffError):
+            raise
+        raise IffError(f"STR# truncated: {e}") from None
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(__doc__)

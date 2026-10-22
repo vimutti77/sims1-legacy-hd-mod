@@ -450,6 +450,19 @@ std::unordered_map<std::string, Packed> g_packed;  // "<name>@<scale>.<ext>" -> 
 std::vector<HANDLE> g_pack_files;
 std::set<std::pair<uint32_t, uint32_t>> g_hd_sizes;        // sizes worth hashing
 std::set<std::pair<uint32_t, uint32_t>> g_z_sizes;         // the same for depth textures (R8)
+// The Sims' portraits (pictures stored in the character files, portraits/build.py): a Sim made
+// or changed brings new ones, which get HD pictures while the game runs. <replace>/portraits.auto
+// names their sizes (looked up on disk when they have no file: new loose files), the size that
+// starts the builder (the control panel faces) and its command line.
+struct LateFiles {
+    std::set<std::pair<uint32_t, uint32_t>> sizes;
+    std::pair<uint32_t, uint32_t> trigger{0, 0};
+    std::string command;
+    std::set<std::string> missing;  // looked up and not there: again once the builder has run
+    HANDLE builder = nullptr;       // the builder process while it runs
+    double started = -1e9;          // when it last started (now_ms)
+};
+LateFiles g_late;
 // Walls: the game uploads an in-lot wall as its wallpaper frame with the empty corners filled
 // (the wall top in one colour, the bottom row repeated down), so only the pixels the frame
 // covers identify the wallpaper. <replace>\<w>x<h>.wallmasks holds the coverage masks of the
@@ -2530,6 +2543,25 @@ void scan_hd_files() {
         logf("hd: %u mostly see-through sprites listed", static_cast<unsigned>(g_translucent.size()));
     if (read_names("mesh.names", g_mesh_names))
         logf("hd: %u mesh textures listed", static_cast<unsigned>(g_mesh_names.size()));
+    if (FILE* f = fopen((g_replace_dir + "\\portraits.auto").c_str(), "rb")) {  // see LateFiles
+        char line[2048];
+        while (fgets(line, sizeof line, f)) {
+            std::string l(line);
+            while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+            unsigned w, h, used = 0;
+            if (!l.compare(0, 6, "sizes ")) {
+                for (const char* p = l.c_str() + 6; sscanf(p, " %ux%u%n", &w, &h, &used) == 2; p += used)
+                    g_late.sizes.insert({w, h});
+            } else if (sscanf(l.c_str(), "trigger %ux%u", &w, &h) == 2) {
+                g_late.trigger = {w, h};
+            } else if (!l.compare(0, 4, "run ")) {
+                g_late.command = l.substr(4);
+            }
+        }
+        fclose(f);
+        logf("hd: portraits looked up late at %u sizes, builder %s", static_cast<unsigned>(g_late.sizes.size()),
+             g_late.command.empty() ? "none" : "set");
+    }
     // wall coverage masks: "WMSK", u32 w, h, count, then count x w*h bytes
     find = FindFirstFileA((g_replace_dir + "\\*.wallmasks").c_str(), &fd);
     if (find != INVALID_HANDLE_VALUE) {
@@ -2802,6 +2834,57 @@ std::string wall_file_name(const ImageInfo& ii, const std::vector<WallMask>& mas
     return "";
 }
 
+// Start the portraits builder (LateFiles) in the background at low priority, its output going
+// to <VKPROXY_DIR>\portraits.log.
+void start_builder() {
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+    HANDLE log = CreateFileA((g_dir + "\\portraits.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    STARTUPINFOA si{sizeof si};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = log;
+    PROCESS_INFORMATION pi{};
+    std::vector<char> cmd(g_late.command.begin(), g_late.command.end());
+    cmd.push_back('\0');
+    bool ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                             nullptr, nullptr, &si, &pi);
+    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+    if (!ok) {
+        logf("hd: portraits builder could not start (error %lu): %s", GetLastError(), g_late.command.c_str());
+        return;
+    }
+    CloseHandle(pi.hThread);
+    g_late.builder = pi.hProcess;
+    g_late.started = now_ms();
+    logf("hd: portraits builder started for new Sims (log: portraits.log)");
+}
+
+// An upload of a portrait's size whose pixels have no HD file: a loose file the builder wrote
+// since the game started is indexed; when there is none and these are a Sim's control panel
+// faces not seen before, the builder is started (once at a time). The pictures it makes show
+// the next time the game uploads them (the next lot).
+void late_lookup(const std::string& name, std::pair<uint32_t, uint32_t> size) {
+    static std::set<std::string> started_for;
+    if (g_late.builder && WaitForSingleObject(g_late.builder, 0) == WAIT_OBJECT_0) {
+        DWORD code = 0;
+        GetExitCodeProcess(g_late.builder, &code);
+        logf("hd: portraits builder finished (exit code %lu, %.0f s)", code, (now_ms() - g_late.started) / 1000);
+        CloseHandle(g_late.builder);
+        g_late.builder = nullptr;
+        g_late.missing.clear();  // look again
+    }
+    if (g_late.missing.count(name)) return;
+    std::string file = name + "@" + std::to_string(g_layer_scale) + ".bgra";
+    if (GetFileAttributesA((g_replace_dir + "\\" + file).c_str()) != INVALID_FILE_ATTRIBUTES && index_file(file)) {
+        g_packed.erase(file);  // loose wins
+        logf("hd: %s made while the game runs", file.c_str());
+        return;
+    }
+    g_late.missing.insert(name);
+    if (size == g_late.trigger && !g_late.command.empty() && !g_late.builder && started_for.insert(name).second)
+        start_builder();
+}
+
 // For each upload into a sampled texture: when its pixels have a replacement
 // file, record (into cb, after the game's own copy) the fill of an HD twin.
 void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
@@ -2824,13 +2907,16 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
                  im->second.id, im->second.w, im->second.h, n, r[0].imageOffset.x, r[0].imageOffset.y,
                  r[0].imageExtent.width, r[0].imageExtent.height, r[0].bufferRowLength, g_frame);
     }
-    if ((colour && (g_hd_sizes.count({im->second.w, im->second.h}) || wall != g_wall_masks.end())) ||
-        (depth && (g_z_sizes.count({im->second.w, im->second.h}) || wall_mask)))
+    std::pair<uint32_t, uint32_t> size{im->second.w, im->second.h};
+    bool late = colour && g_late.sizes.count(size);
+    if ((colour && (g_hd_sizes.count(size) || wall != g_wall_masks.end() || late)) ||
+        (depth && (g_z_sizes.count(size) || wall_mask)))
         if (const unsigned char* p = upload_pixels(src, dst, n, r, &info)) {
             double t0 = now_ms();
             name = content_name(*info, p);
             g_perf.hash += now_ms() - t0;
             ++g_perf.hashed;
+            if (late && !g_hd_names.count(name)) late_lookup(name, size);
         }
     if (colour) {
         if (!name.empty() && g_translucent.count(name))

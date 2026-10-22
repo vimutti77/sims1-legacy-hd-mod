@@ -9,8 +9,8 @@ character file (UserData*\\Characters\\User*.iff, BMP_ chunks), drawn when the S
     2006 'speech_large'  32x32
     2007 'web_image'     45x45   (not in every file)
 Legacy uploads them truncated to RGB565, like the UI bitmaps, so vkproxy finds each by name.
-For every human Sim (skeleton adult or child; a pet's head is part of its body mesh, which
-needs the skeleton: not done) this reads the head skins and texture from STR# 200 (e.g.
+For every Sim (skeleton adult or child; for a cat or dog, the skins on the head bone in its
+body suit, head_of) this reads the head skins and texture from STR# 200 (e.g.
 "c802fa_cornelia,HEAD-HEAD=c802falgt_cornelia": xskin-c802fa_cornelia-HEAD-HEAD.bmf/.skn and
 c802falgt_cornelia.bmp), finds the pose each picture was drawn with (pose.py), and draws it
 again three times larger with the HD head texture (tools/hd_skins.py, read from the installed
@@ -64,6 +64,7 @@ SCALE = 3
 SAMPLES = 4       # per pixel and axis when drawing the HD picture
 SKIP_ARCHIVES = ("uigraphics.far", "sound.far", "sounddata.far")
 HUMANS = ("adult", "child")
+PETS = ("kat", "dog")  # their head: the skins on the head bone in the body suit (head_of)
 # chunk id -> (regions (x, y, w, h) holding a head, whether they all show the same pose, the
 # worst fit error kept: small pictures differ more per pixel when the fit is right, checked
 # by eye on the pictures just over it)
@@ -152,13 +153,20 @@ def _init(files: dict, replace: str) -> None:
     _installed = hd_pack.Installed(Path(replace))
 
 
-def head_of(entry: str) -> tuple[list[skn.Skin], list[np.ndarray], list[np.ndarray]] | str:
-    """The skins of a head entry of STR# 200 with their textures at 1x and 3x, or why not."""
+def head_of(entry: str, pet: bool = False) -> tuple[list[skn.Skin], list[np.ndarray], list[np.ndarray]] | str:
+    """The head skins of an entry of STR# 200 with their textures at 1x and 3x, or why not. A
+    person's head entry names the head suit and its skin tone's texture
+    (c802fa_cornelia,HEAD-HEAD=c802falgt_cornelia); a pet has no head suit, its head is the
+    skins on the head bone in its body suit (b006cat_siamese,BODY=b006cat_siamese: the head,
+    and the jaw and eyes of some), each in the texture its mesh names (else the coat's)."""
     parts = [p.strip() for p in entry.split(",") if p.strip()]
     if len(parts) < 2 or parts[0].upper() == "NONE":
         return f"no head ({entry!r})"
     suit, skins, tex1, tex3 = parts[0], [], [], []
     named = dict(p.partition("=")[::2] for p in parts[1:])  # skin -> texture (the Sim's skin tone)
+    coat = None
+    if pet:
+        coat, named = next(iter(named.values()), None), {}
     # the suit's other skins on the head (glasses, a hat) keep the texture their mesh names
     prefix = f"xskin-{suit}-".lower()
     others = sorted({n[len(prefix):-4] for n in _files if n.startswith(prefix) and n.endswith((".bmf", ".skn"))}
@@ -179,6 +187,9 @@ def head_of(entry: str) -> tuple[list[skn.Skin], list[np.ndarray], list[np.ndarr
             continue
         tex_name = named.get(skin_name, skin.texture)
         tex = read_file(_files, tex_name + ".bmp")
+        if tex is None and coat:
+            tex_name = coat
+            tex = read_file(_files, tex_name + ".bmp")
         if tex is None:
             if skin_name in named:
                 return f"missing {tex_name}.bmp"
@@ -242,10 +253,11 @@ def build_character(job) -> list[tuple]:
     todo = [p for p in pictures if force or not ((hd_dir / f"{p[4]}@{SCALE}.bgra").exists() or p[4] in failed)]
     if not todo:
         return [(path.name, sim, cid, name, "", "built before") for cid, _w, _h, _rgba, name in pictures]
-    if len(body) < 3 or body[0].lower() not in HUMANS:
+    if len(body) < 3 or body[0].lower() not in HUMANS + PETS:
         why = f"skeleton {body[0]!r}: not done" if body else "no STR# 200"
         return [(path.name, sim, cid, name, "", why) for cid, _w, _h, _rgba, name in todo]
-    found = head_of(body[2])
+    pet = body[0].lower() in PETS
+    found = head_of(body[1] if pet else body[2], pet)
     if isinstance(found, str):
         return [(path.name, sim, cid, name, "", found) for cid, _w, _h, _rgba, name in todo]
     skins, tex1, tex3 = found

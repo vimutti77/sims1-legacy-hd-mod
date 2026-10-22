@@ -72,22 +72,33 @@ POSES: dict[int, list[tuple]] = {
     2004: [(0.004, -0.161, 0.002, 29.419, 11.822, 16.500)],
     2007: [(0.003, -0.213, 0.003, 43.504, 19.011, 27.615)],  # the pitch varies (-0.28..-0.10): no rule found
 }
-# The speech balloons' pictures are framed to the head instead: turned so, the head's outline
+# Pets (cats and dogs alike) are drawn turned the same, nearer: medians of the 19 pets of a
+# neighbourhood (spread under 0.035 rad, 1 px scale, 0.55 px; 2007's pitch spreads as people's).
+PET_POSES: dict[int, list[tuple]] = {
+    2002: [(0.002, -0.185, -0.001, 55.691, 18.114, 29.286),
+           (0.133, -0.325, 0.046, 55.693, 18.080, 29.297),
+           (-0.118, -0.016, -0.001, 55.992, 18.119, 29.342)],
+    2003: [(-0.313, -0.086, -0.025, 63.793, 20.676, 30.628)] * 5,
+    2004: [(0.004, -0.171, 0.003, 36.427, 11.866, 17.651)],
+    2007: [(0.019, -0.269, 0.020, 45.648, 18.919, 27.247)],
+}
+# The speech balloons' pictures are framed to the head instead (people's and pets'): turned so, the head's outline
 # as drawn fills the picture's height, its top at the top, centred across (scale off by 0.8%
 # at the median, 2.5% at the 90th percentile).
 FRAMED = {2005: (-0.337, -0.093, -0.022), 2006: (-0.322, -0.075, -0.022)}
 # What vkproxy accepts: the closest head's mean difference per channel (of 255) at most the first
 # value, and the next closest's at least the second value more (small pictures of different
-# heads look alike). Emulated on the 246 human Sims of two neighbourhoods, ready-made ones
-# included (those must not match): no picture was given another head's at slightly looser
-# limits (2002 19.5/1, 2003 12/0, 2004 11.5/1, 2005 18/1, 2006 17/3, 2007 9.5/1).
-ACCEPT = {2002: (14.0, 2.0), 2003: (11.0, 1.0), 2004: (11.0, 1.5), 2005: (16.0, 2.0), 2006: (15.0, 3.0),
-          2007: (9.0, 1.5)}
+# heads look alike, and a broken picture that is nearly all background is close to the smallest
+# head). Emulated on the Sims and pets of two neighbourhoods, ready-made ones and the game's
+# broken pictures included (those must not match): no picture gets another head's. Pictures
+# taken (people + pets): 2002 131, 2003 132, 2004 129, 2005 67, 2006 113, 2007 55.
+ACCEPT = {2002: (14.0, 2.5), 2003: (11.0, 1.0), 2004: (11.0, 1.5), 2005: (16.0, 2.0), 2006: (15.0, 3.0),
+          2007: (9.0, 2.5)}
 
 
-def poses_for(head: Head, cid: int) -> list[tuple]:
+def poses_for(head: Head, cid: int, pet: bool = False) -> list[tuple]:
     if cid not in FRAMED:
-        return POSES[cid]
+        return (PET_POSES if pet else POSES)[cid]
     w, h = redraw.SIZES[cid]
     turn = FRAMED[cid]
     sx, sy, _ = project(head, (*turn, 1.0, 0.0, 0.0))
@@ -100,9 +111,13 @@ def key_id(key: str) -> str:
     return spr2.content_name(0, 0, key.encode("utf-8")).split("_", 1)[1]
 
 
+PET = re.compile(r"b\d{3}(cat|kat|dog)_")
+
+
 def candidates(files: dict) -> list[tuple[str, str]]:
     """(suit, texture) of every head the game has: each head suit with each head texture of its
-    code (c802fa_cornelia: c802falgt_cornelia, c802fadrk_cornelia3, ...)."""
+    code (c802fa_cornelia: c802falgt_cornelia, c802fadrk_cornelia3, ...), and each pet's body
+    suit with the coat named after it (b006cat_siamese: b006cat_siamese)."""
     suits = sorted({n[len("xskin-"):n.rindex("-head-head.")] for n in files
                     if n.startswith("xskin-") and "-head-head." in n})
     textures = sorted(n[:-4] for n in files if n.endswith(".bmp"))
@@ -113,16 +128,18 @@ def candidates(files: dict) -> list[tuple[str, str]]:
             continue
         code = m.group(1)
         out += [(suit, t) for t in textures if t.startswith(code) and t[len(code):len(code) + 3] in TONES]
-    return out
+    pets = sorted({n[len("xskin-"):n.index("-head-", 6)] for n in files
+                   if n.startswith("xskin-") and "-head-" in n and PET.match(n[len("xskin-"):])})
+    return out + [(suit, suit) for suit in pets if suit + ".bmp" in files]
 
 
-def picture(head: Head, textures, cid: int, scale: int) -> np.ndarray:
-    """The picture cid of this head (RGB floats) at 1x or 3x, as Create-a-Sim draws it."""
+def picture(head: Head, textures, cid: int, scale: int, pet: bool = False) -> np.ndarray:
+    """The picture cid of this head (RGB floats) at 1x or 3x, as the game draws a new Sim's."""
     w, h = redraw.SIZES[cid]
     out = np.zeros((h * scale, w * scale, 3))
     if cid == 2004:
         out[:] = FRAME_2004
-    for (x, y, rw, rh), bg, p in zip(redraw.PICTURES[cid][0], BACKGROUNDS[cid], poses_for(head, cid)):
+    for (x, y, rw, rh), bg, p in zip(redraw.PICTURES[cid][0], BACKGROUNDS[cid], poses_for(head, cid, pet)):
         drawn = (*p[:3], p[3] * scale, p[4] * scale, p[5] * scale)
         colour, cov = render(head, textures, drawn, (rw * scale, rh * scale), redraw.SAMPLES)
         out[y * scale:(y + rh) * scale, x * scale:(x + rw) * scale] = compose(colour, cov, bg)
@@ -133,7 +150,8 @@ def build_head(job):
     """(id, {cid: 1x bytes as uploaded}) of one head and texture, its 3x pictures written; or
     (key, reason) when it cannot be drawn."""
     suit, texture, out_dir = job
-    found = redraw.head_of(f"{suit},HEAD-HEAD={texture}")
+    pet = bool(PET.match(suit))
+    found = redraw.head_of(f"{suit},BODY={texture}" if pet else f"{suit},HEAD-HEAD={texture}", pet)
     key = f"{suit}={texture}"
     if isinstance(found, str):
         return key, found
@@ -143,10 +161,10 @@ def build_head(job):
     small = {}
     for cid in redraw.PICTURES:
         w, h = redraw.SIZES[cid]
-        one = picture(head, tex1, cid, 1)
+        one = picture(head, tex1, cid, 1, pet)
         rgba = np.concatenate([one, np.full((h, w, 1), 255, np.uint8)], 2).tobytes()
         small[cid] = hd_ui.upload(rgba)  # B8G8R8A8, RGB565-truncated
-        big = picture(head, tex3, cid, redraw.SCALE)
+        big = picture(head, tex3, cid, redraw.SCALE, pet)
         bgra = np.concatenate([big[..., ::-1], np.full(big.shape[:2] + (1,), 255, np.uint8)], 2)
         (Path(out_dir) / f"{w}x{h}_{hid}@{redraw.SCALE}.bgra").write_bytes(bgra.tobytes())
     return hid, small

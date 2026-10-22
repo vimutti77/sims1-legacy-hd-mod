@@ -17,6 +17,16 @@ and draws it again at 3x with the HD head texture made by `tools/hd_skins.py`
 py portraits\redraw.py --game "<install dir>" --install
 ```
 
-Run it again after making or changing Sims: their pictures are new. Pets (skeletons `kat`,
-`dog`) are not done yet: their head is part of the body mesh, which needs the skeleton.
-Needs numpy. Findings: `docs/FINDINGS.md`, "ภาพหัวในแถบควบคุม".
+Sims made later (in Create-a-Sim, townies and NPCs as the game makes them) get pictures
+the game draws with one camera per picture. `library.py` draws every head the game has, with
+each of its skin textures, into the six pictures ahead (690 heads, about a minute on 24
+cores, 434 MB): vkproxy matches a new picture with the closest at 1x and shows its 3x one.
+
+```powershell
+py portraits\library.py --game "<install dir>" --install
+```
+
+Players get the files these make (`redraw.py`'s for the ready-made Sims, `library.py`'s for
+the rest); they run neither. Pets (skeletons `kat`, `dog`) are not done yet: their head is
+part of the body mesh, which needs the skeleton. Needs numpy. Findings: `docs/FINDINGS.md`,
+"ภาพหัวในแถบควบคุม".

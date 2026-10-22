@@ -2,7 +2,9 @@
 
 Needs numpy; skipped without it.
 """
+import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,7 @@ import skn  # noqa: E402
 try:
     import numpy as np
 
+    import library
     import pose
     import redraw
     from head import Head, compose, render
@@ -116,6 +119,42 @@ class BuildTests(unittest.TestCase):
         self.assertTrue((hd[:3] == (0, 0, 248)).all() and (hd[:, :3] == (0, 0, 248)).all())  # 3 px of frame
         self.assertTrue(np.allclose(hd[37, 37], (240, 200, 160), atol=2))  # the front, middle
         self.assertTrue(np.allclose(hd[5, 5], (0, 0, 0), atol=2))  # background inside the frame
+
+
+@unittest.skipIf(np is None, "needs numpy")
+class LibraryTests(unittest.TestCase):
+    def test_heads_pair_with_the_textures_of_their_code(self):
+        files = {n: () for n in ("xskin-c802fa_cornelia-head-head.bmf", "xskin-c802fa_cornelia-head-hat.bmf",
+                                 "c802falgt_cornelia.bmp", "c802fadrk_other.bmp", "c802fa_cornelia.bmp",
+                                 "c803malgt_gunter.bmp", "xskin-b602faskn_x-pelvis-body.bmf")}
+        self.assertEqual(library.candidates(files), [("c802fa_cornelia", "c802fadrk_other"),
+                                                     ("c802fa_cornelia", "c802falgt_cornelia")])
+        self.assertRegex(library.key_id("c802fa_cornelia=c802falgt_cornelia"), "^[0-9a-f]{16}$")
+
+    def test_speech_pictures_are_framed_to_the_head(self):
+        head, tex = box_head()
+        pose_2006 = library.poses_for(head, 2006)[0]
+        colour, cov = render(head, tex, pose_2006, (32, 32), ss=4)
+        rows = np.nonzero(cov.max(1) > 0.5)[0]
+        cols = np.nonzero(cov.max(0) > 0.5)[0]
+        self.assertEqual((rows.min(), rows.max()), (0, 31))  # fills the height, top at the top
+        self.assertLessEqual(abs((cols.min() + cols.max() + 1) / 2 - 16), 1)  # centred across
+
+    def test_library_file(self):
+        heads = [("00000000000000aa", {cid: bytes([i]) * (w * h * 4) for cid, (w, h) in redraw.SIZES.items()})
+                 for i in (1, 2)]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "portraits.lib"
+            library.write_library(path, heads)
+            data = path.read_bytes()
+        self.assertEqual(data[:12], b"PLIB" + struct.pack("<II", 2, len(redraw.PICTURES)))
+        w, h, n, err, margin = struct.unpack_from("<IIIff", data, 12)
+        self.assertEqual((w, h, n), (105, 41, 2))
+        self.assertEqual((err, margin), library.ACCEPT[2002])
+        self.assertEqual(struct.unpack_from("<Q", data, 32)[0], 0xaa)
+        self.assertEqual(data[40:44], bytes([1]) * 4)
+        size = 12 + sum(20 + 2 * (8 + w * h * 4) for w, h in redraw.SIZES.values())
+        self.assertEqual(len(data), size)
 
 
 if __name__ == "__main__":

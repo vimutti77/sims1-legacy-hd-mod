@@ -79,13 +79,18 @@ instead of the system loader. It forwards every call to the real loader
   mipmaps (linear blits when the twin is made) and are drawn with a trilinear copy of the
   game's sampler; a 3x texture shown smaller than itself would shimmer otherwise.
 - portraits: the Sims' portraits are pictures stored in the character files, drawn again
-  at 3x by `portraits/redraw.py`. A Sim made or changed while playing brings new ones, so
-  `<replace>/portraits.auto` (written by the builder) names their sizes, which are looked up
-  on disk when they have no file (a loose file written since the game started is taken),
-  and the builder's command line, which the proxy starts in the background at low priority
-  (output in `portraits.log`) when it sees control panel faces (105x41) it has no file for,
-  once per such picture a session. The new pictures show the next time the game uploads
-  them (the next lot).
+  at 3x by `portraits/redraw.py` (matched by name, like any content replacement). Sims made
+  later (Create-a-Sim, townies, NPCs) bring new pictures, which the game draws with one
+  camera: `portraits/library.py` draws every head and skin texture ahead, and
+  `<replace>/portraits.lib` holds them at 1x as uploaded. A picture of a portrait's size
+  without an HD file is compared with those (SSE sum of absolute differences, a few ms, once
+  per picture); the closest is shown from its 3x file when its mean difference is low enough
+  and the next closest is clearly further off (the limits are in the library file: small
+  pictures of different heads look alike). Pets and custom heads are not in the library.
+  For development only, `<replace>/portraits.auto` (written by `redraw.py --install`) names
+  the portraits' sizes, looked up on disk when they have no file, and `redraw.py`'s command,
+  which the proxy starts in the background at low priority when it sees control panel faces
+  (105x41) it has no file for (output in `portraits.log`); players do not get it.
 - depth twins: each object sprite comes with a 1x depth texture (R8: the sprite's z, 0
   where it has no pixel, i.e. nearest). For a sprite whose HD coverage grows past the
   original (an outline rounded off by hand, `hd_art.py --install-edits`), a 3x depth

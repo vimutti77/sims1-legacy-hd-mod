@@ -463,6 +463,19 @@ struct LateFiles {
     double started = -1e9;          // when it last started (now_ms)
 };
 LateFiles g_late;
+// Portraits of Sims made later (Create-a-Sim, townies, NPCs: the game draws them with one camera),
+// drawn ahead for every head and skin texture (portraits/library.py): <replace>/portraits.lib holds
+// each one at 1x as the game uploads it; an upload of a portrait's size without an HD file is
+// compared with them, and the closest, when close enough, is shown from its 3x file
+// (<w>x<h>_<id>@<scale>.bgra).
+struct PortraitLib {
+    std::vector<uint64_t> ids;
+    std::vector<unsigned char> pixels;  // ids.size() x w * h * 4, B8G8R8A8
+    float max_error = 0;  // the closest's mean difference per channel (of 255) accepted
+    float margin = 0;     // by which the next closest must be further off (heads look alike small)
+};
+std::map<std::pair<uint32_t, uint32_t>, PortraitLib> g_portraits;
+std::unordered_map<std::string, std::string> g_portrait_match;  // upload's name -> library file, or ""
 // Walls: the game uploads an in-lot wall as its wallpaper frame with the empty corners filled
 // (the wall top in one colour, the bottom row repeated down), so only the pixels the frame
 // covers identify the wallpaper. <replace>\<w>x<h>.wallmasks holds the coverage masks of the
@@ -2562,6 +2575,35 @@ void scan_hd_files() {
         logf("hd: portraits looked up late at %u sizes, builder %s", static_cast<unsigned>(g_late.sizes.size()),
              g_late.command.empty() ? "none" : "set");
     }
+    // the portraits drawn ahead: "PLIB", u32 version, kinds; per kind u32 w, h, count, f32 max
+    // error, margin, then count x (u64 id, w * h * 4 bytes)
+    if (FILE* f = fopen((g_replace_dir + "\\portraits.lib").c_str(), "rb")) {
+        char magic[4];
+        uint32_t head[2], kind[3];
+        float accept[2];
+        if (fread(magic, 1, 4, f) == 4 && !memcmp(magic, "PLIB", 4) && fread(head, 4, 2, f) == 2 && head[0] == 2) {
+            for (uint32_t k = 0; k < head[1] && fread(kind, 4, 3, f) == 3 && fread(accept, 4, 2, f) == 2; ++k) {
+                if (!kind[0] || !kind[1] || kind[0] * kind[1] > (1u << 16) || kind[2] > 100000) break;
+                PortraitLib& lib = g_portraits[{kind[0], kind[1]}];
+                lib.max_error = accept[0];
+                lib.margin = accept[1];
+                size_t bytes = 4ull * kind[0] * kind[1];
+                lib.ids.resize(kind[2]);
+                lib.pixels.resize(bytes * kind[2]);
+                bool ok = true;
+                for (uint32_t i = 0; i < kind[2] && ok; ++i)
+                    ok = fread(&lib.ids[i], 8, 1, f) == 1 && fread(&lib.pixels[bytes * i], 1, bytes, f) == bytes;
+                if (!ok) {
+                    g_portraits.erase({kind[0], kind[1]});
+                    break;
+                }
+            }
+        }
+        fclose(f);
+        size_t n = 0;
+        for (auto& [size, lib] : g_portraits) n += lib.ids.size();
+        logf("hd: %zu portraits drawn ahead at %zu sizes", n, g_portraits.size());
+    }
     // wall coverage masks: "WMSK", u32 w, h, count, then count x w*h bytes
     find = FindFirstFileA((g_replace_dir + "\\*.wallmasks").c_str(), &fd);
     if (find != INVALID_HANDLE_VALUE) {
@@ -2885,6 +2927,52 @@ void late_lookup(const std::string& name, std::pair<uint32_t, uint32_t> size) {
         start_builder();
 }
 
+__attribute__((target("sse2"))) uint64_t sum_abs_diff(const unsigned char* a, const unsigned char* b, size_t n) {
+    __m128i acc = _mm_setzero_si128();
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16)
+        acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)),
+                                              _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
+    uint64_t lanes[2];
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(lanes), acc);
+    uint64_t s = lanes[0] + lanes[1];
+    for (; i < n; ++i) s += a[i] > b[i] ? a[i] - b[i] : b[i] - a[i];
+    return s;
+}
+
+// The library portrait (PortraitLib) closest to an upload without an HD file (its pixels in
+// g_name_buf), as a replacement file name, or "" when none is close enough.
+std::string portrait_match(const std::string& name, const ImageInfo& ii) {
+    auto lib = g_portraits.find({ii.w, ii.h});
+    if (lib == g_portraits.end() || lib->second.ids.empty()) return "";
+    auto cached = g_portrait_match.find(name);
+    if (cached != g_portrait_match.end()) return cached->second;
+    double t0 = now_ms();
+    size_t bytes = 4ull * ii.w * ii.h;
+    uint64_t best = UINT64_MAX, next = UINT64_MAX;
+    size_t at = 0;
+    for (size_t k = 0; k < lib->second.ids.size(); ++k) {
+        uint64_t s = sum_abs_diff(g_name_buf.data(), &lib->second.pixels[bytes * k], bytes);
+        if (s < best) {
+            next = best;
+            best = s;
+            at = k;
+        } else if (s < next) {
+            next = s;
+        }
+    }
+    double per = 3.0 * ii.w * ii.h;  // alpha is 255 in both
+    char found[64];
+    snprintf(found, sizeof found, "%ux%u_%016llx", ii.w, ii.h, static_cast<unsigned long long>(lib->second.ids[at]));
+    double err = best / per, next_err = next == UINT64_MAX ? 1e9 : next / per;
+    bool close = err <= lib->second.max_error && next_err - err >= lib->second.margin;
+    std::string file = close && g_hd_names.count(found) ? found : "";
+    logf("portrait: %s is closest to %s (error %.1f, the next %.1f; %.1f ms)%s", name.c_str(), found, err,
+         next == UINT64_MAX ? 0.0 : next_err, now_ms() - t0, file.empty() ? ": not sure enough, kept" : "");
+    g_portrait_match[name] = file;
+    return file;
+}
+
 // For each upload into a sampled texture: when its pixels have a replacement
 // file, record (into cb, after the game's own copy) the fill of an HD twin.
 void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
@@ -2909,7 +2997,8 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     }
     std::pair<uint32_t, uint32_t> size{im->second.w, im->second.h};
     bool late = colour && g_late.sizes.count(size);
-    if ((colour && (g_hd_sizes.count(size) || wall != g_wall_masks.end() || late)) ||
+    bool portrait = colour && g_portraits.count(size);
+    if ((colour && (g_hd_sizes.count(size) || wall != g_wall_masks.end() || late || portrait)) ||
         (depth && (g_z_sizes.count(size) || wall_mask)))
         if (const unsigned char* p = upload_pixels(src, dst, n, r, &info)) {
             double t0 = now_ms();
@@ -2940,7 +3029,10 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     std::string file = name;  // the replacement file, without @scale
     HdImage::Kind kind = HdImage::kFile;
     if (!g_hd_names.count(name)) {
-        if (wall_mask) {  // no file: the upload magnified
+        std::string drawn_ahead = portrait ? portrait_match(name, *info) : std::string();
+        if (!drawn_ahead.empty()) {
+            file = drawn_ahead;
+        } else if (wall_mask) {  // no file: the upload magnified
             file.clear();
             kind = HdImage::kWallMask;
         } else {

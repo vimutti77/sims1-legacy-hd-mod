@@ -27,6 +27,6 @@ py portraits\library.py --game "<install dir>" --install
 ```
 
 Players get the files these make (`redraw.py`'s for the ready-made Sims, `library.py`'s for
-the rest); they run neither. Pets (skeletons `kat`, `dog`) are not done yet: their head is
-part of the body mesh, which needs the skeleton. Needs numpy. Findings: `docs/FINDINGS.md`,
-"ภาพหัวในแถบควบคุม".
+the rest); they run neither. Pets are done too: a cat's or dog's head is the skins on the
+head bone in its body suit, drawn nearer (`PET_POSES`). Needs numpy. Findings:
+`docs/FINDINGS.md`, "ภาพหัวในแถบควบคุม".

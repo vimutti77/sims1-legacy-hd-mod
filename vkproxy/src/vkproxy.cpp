@@ -106,6 +106,7 @@ unsigned g_frame = 0;
 bool g_trace = false;  // log draws until the next present
 unsigned g_trace_left = 0;  // frames still to trace (F11: kTraceFrames)
 const unsigned kTraceFrames = 90;  // ~1.5 s: time to press F11 and then do what is to be traced
+const unsigned kFirstPasses = 2;   // passes logged per small target image (begin_pass)
 bool g_xbr_on = true;
 bool g_hd_on = true;  // F9 / hd.toggle: draw with HD twins (content replacement)
 bool g_world_on = true;  // F6 / world.toggle, VKPROXY_WORLDFIX=0: the world shader twins (kWorldShaders)
@@ -323,6 +324,7 @@ struct CmdState {
     uint32_t rp_w = 0, rp_h = 0;
     std::vector<uint64_t> targets;  // views being rendered to
     int scale = 1;                  // >1 while inside a pass into enlarged targets
+    bool log_pass = false;          // one of the first passes of its size into a small target: logged
     VkRect2D area{};                // render area of the current pass (as issued)
     std::vector<VkViewport> viewports;  // as last set by the game (unscaled)
     std::vector<VkRect2D> scissors;
@@ -351,6 +353,8 @@ std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
 std::unordered_map<uint64_t, uint64_t> g_view_image;        // VkImageView -> VkImage
 std::unordered_map<uint64_t, FbInfo> g_fbs;                 // VkFramebuffer
 std::unordered_map<uint64_t, std::string> g_samplers;       // VkSampler -> "mag/min"
+std::unordered_map<uint64_t, VkSamplerCreateInfo> g_sampler_ci;  // VkSampler -> how the game made it
+std::unordered_map<uint64_t, VkSampler> g_mip_samplers;          // game sampler -> trilinear copy (mesh twins)
 std::unordered_map<uint64_t, std::vector<Binding>> g_sets;  // VkDescriptorSet
 std::unordered_map<uint64_t, std::string> g_modules;        // VkShaderModule -> spv file
 std::unordered_map<uint64_t, unsigned> g_pipelines;         // VkPipeline -> id
@@ -405,6 +409,7 @@ struct HdImage {
     std::string name;
     VkDeviceSize bytes = 0;
     Kind kind = kFile;
+    uint32_t mips = 1;        // > 1: a mesh texture's twin (see g_mesh_names)
     int block = -1;           // the block holding it, or -1
     VkDeviceSize offset = 0;  // its range there
 };
@@ -471,6 +476,10 @@ std::unordered_map<uint64_t, std::string> g_image_name;  // VkImage -> content n
 // <replace>/translucent.names): they win ties at the very same depth (object_rank).
 std::unordered_set<std::string> g_translucent;
 std::unordered_set<uint64_t> g_translucent_images;  // VkImages whose last upload is one of them
+// Textures of 3D meshes (the Sims, tools/hd_skins.py, <replace>/mesh.names). A mesh is drawn at
+// any size, so unlike a sprite's, a 3x twin is mostly shown smaller than it is: these twins get
+// mipmaps and are sampled trilinearly (else they shimmer at the middle and far zooms).
+std::unordered_set<std::string> g_mesh_names;
 struct PipeInfo {
     std::string vs, fs;
     std::vector<VkVertexInputBindingDescription> bindings;
@@ -721,8 +730,13 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateSampler(VkDevice d, const VkSamplerCre
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         std::string s = std::string(filter_name(ci->magFilter)) + "/" + filter_name(ci->minFilter);
         g_samplers[(uint64_t)*out] = s;
-        logf("createSampler %s address=%d/%d unnormalized=%u", s.c_str(), static_cast<int>(ci->addressModeU),
-             static_cast<int>(ci->addressModeV), ci->unnormalizedCoordinates);
+        g_sampler_ci[(uint64_t)*out] = *ci;
+        g_sampler_ci[(uint64_t)*out].pNext = nullptr;
+        g_mip_samplers.erase((uint64_t)*out);  // a reused handle (ours is left alive: sets may use it)
+        logf("createSampler %s address=%d/%d unnormalized=%u mipmap=%s lod=%g..%g bias=%g anisotropy=%u/%g",
+             s.c_str(), static_cast<int>(ci->addressModeU), static_cast<int>(ci->addressModeV),
+             ci->unnormalizedCoordinates, ci->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest",
+             ci->minLod, ci->maxLod, ci->mipLodBias, ci->anisotropyEnable, ci->maxAnisotropy);
     }
     return r;
 }
@@ -923,10 +937,17 @@ void begin_pass(VkCommandBuffer cb, uint32_t w, uint32_t h, std::vector<uint64_t
     st.rp_w = w;
     st.rp_h = h;
     st.targets = std::move(targets);
-    if (g_trace) {
+    // The first few passes into each target smaller than the screen are logged with their draws,
+    // as a trace would: such targets are often drawn once and then shown for a long time (UI
+    // windows, the Sims' portraits when a lot loads), too seldom for a trace to catch.
+    static std::unordered_map<uint64_t, unsigned> seen;  // target image -> passes into it
+    auto first = st.targets.empty() ? g_view_image.end() : g_view_image.find(st.targets[0]);
+    st.log_pass = g_swap_w && (w < g_swap_w || h < g_swap_h) && first != g_view_image.end() &&
+                  seen[first->second]++ < kFirstPasses;
+    if (g_trace || st.log_pass) {
         std::string t;
         for (auto v : st.targets) t += " " + image_desc(v);
-        logf("  [%s] %ux%u ->%s", how, w, h, t.c_str());
+        logf("  [%s] %ux%u ->%s%s", how, w, h, t.c_str(), g_trace ? "" : " (one of the first of its size)");
     }
 }
 
@@ -1099,6 +1120,31 @@ struct HdBind {
     bool any() const { return ours[0] || ours[1]; }
 };
 
+// The game's sampler made trilinear (linear filters, every mip level), for mesh twins; the game's
+// own when that cannot be made.
+VkSampler mip_sampler_for(VkSampler game) {
+    auto cached = g_mip_samplers.find((uint64_t)game);
+    if (cached != g_mip_samplers.end()) return cached->second;
+    auto ci = g_sampler_ci.find((uint64_t)game);
+    auto create = reinterpret_cast<PFN_vkCreateSampler>(device_fn("vkCreateSampler"));
+    VkSampler ours = VK_NULL_HANDLE;
+    if (ci != g_sampler_ci.end() && create && !ci->second.unnormalizedCoordinates) {
+        VkSamplerCreateInfo sci = ci->second;
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.minLod = 0;
+        sci.maxLod = VK_LOD_CLAMP_NONE;
+        if (create(g_device, &sci, nullptr, &ours) != VK_SUCCESS) ours = VK_NULL_HANDLE;
+    }
+    if (!ours) {
+        logf("hd: no trilinear sampler for sampler %s: mesh twins drawn with it",
+             g_samplers.count((uint64_t)game) ? g_samplers[(uint64_t)game].c_str() : "?");
+        ours = game;
+    }
+    g_mip_samplers[(uint64_t)game] = ours;
+    return ours;
+}
+
 // Our copy of the draw's set s when that set holds only one texture and it has a twin
 // (whose kind goes to *kind).
 VkDescriptorSet hd_set_for(const CmdState& st, size_t s, HdImage::Kind* kind) {
@@ -1137,7 +1183,9 @@ VkDescriptorSet hd_set_for(const CmdState& st, size_t s, HdImage::Kind* kind) {
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &layout;
     if (real_vkAllocateDescriptorSets(g_device, &ai, &ours) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkDescriptorImageInfo ii{(VkSampler)b0->sampler, hd->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkSampler sampler = (VkSampler)b0->sampler;
+    if (hd->second.mips > 1) sampler = mip_sampler_for(sampler);
+    VkDescriptorImageInfo ii{sampler, hd->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = ours;
     w.descriptorCount = 1;
@@ -1169,8 +1217,8 @@ HdBind hd_bind_for(VkCommandBuffer cb) {
 
 void trace_draw(VkCommandBuffer cb, const char* kind, uint32_t count) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
-    if (!g_trace) return;
     CmdState& st = g_cmd[cb];
+    if (!g_trace && !st.log_pass) return;
     auto p = g_pipelines.find(st.pipeline);
     std::string tex;
     for (size_t s = 0; s < st.sets.size(); ++s) {
@@ -1619,11 +1667,16 @@ bool tracing() {
     return g_trace;
 }
 
+bool logging_pass(VkCommandBuffer cb) {  // inside one of the first passes of its size (begin_pass)
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    return g_cmd[cb].log_pass;
+}
+
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n,
                                                const VkViewport* v) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
-    if (g_trace && n) logf("    setViewport (%.1f,%.1f %.1fx%.1f)", v[0].x, v[0].y, v[0].width, v[0].height);
     CmdState& st = g_cmd[cb];
+    if ((g_trace || st.log_pass) && n) logf("    setViewport (%.1f,%.1f %.1fx%.1f)", v[0].x, v[0].y, v[0].width, v[0].height);
     if (st.viewports.size() < first + n) st.viewports.resize(first + n);
     for (uint32_t i = 0; i < n; ++i) st.viewports[first + i] = v[i];
     if (st.scale > 1) {
@@ -1654,7 +1707,7 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdSetScissor(VkCommandBuffer cb, uint32_t first
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
                                                  VkShaderStageFlags stages, uint32_t offset, uint32_t size,
                                                  const void* values) {
-    if (tracing()) {
+    if (tracing() || logging_pass(cb)) {
         std::string s;
         auto f = static_cast<const float*>(values);
         for (uint32_t i = 0; i < size / 4 && i < 16; ++i) {
@@ -2416,16 +2469,22 @@ void scan_hd_files() {
         if (index_file(n)) g_packed.erase(n);
     logf("hd: %u packs (%u files in them), %u loose files, indexed in %.0f ms", static_cast<unsigned>(packs.size()),
          static_cast<unsigned>(g_packed.size()), static_cast<unsigned>(loose.size()), now_ms() - t0);
-    if (FILE* f = fopen((g_replace_dir + "\\translucent.names").c_str(), "rb")) {
+    auto read_names = [](const char* file, std::unordered_set<std::string>& names) {
+        FILE* f = fopen((g_replace_dir + "\\" + file).c_str(), "rb");
+        if (!f) return false;
         char line[128];
         while (fgets(line, sizeof line, f)) {
             std::string n(line);
             while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
-            if (!n.empty()) g_translucent.insert(n);
+            if (!n.empty()) names.insert(n);
         }
         fclose(f);
+        return true;
+    };
+    if (read_names("translucent.names", g_translucent))
         logf("hd: %u mostly see-through sprites listed", static_cast<unsigned>(g_translucent.size()));
-    }
+    if (read_names("mesh.names", g_mesh_names))
+        logf("hd: %u mesh textures listed", static_cast<unsigned>(g_mesh_names.size()));
     // wall coverage masks: "WMSK", u32 w, h, count, then count x w*h bytes
     find = FindFirstFileA((g_replace_dir + "\\*.wallmasks").c_str(), &fd);
     if (find != INVALID_HANDLE_VALUE) {
@@ -2571,10 +2630,28 @@ void free_hd(HdImage& hd) {
     hd = HdImage{};
 }
 
-// A sampled image `scale` times the size of ii, with a view, or an empty HdImage.
-HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
+// Whether mesh twins can have their mipmaps made by linear blits (B8G8R8A8, optimal tiling).
+bool mip_blit_ok() {
+    static int ok = -1;
+    if (ok < 0) {
+        auto format_props = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+            real_GIPA(g_instance, "vkGetPhysicalDeviceFormatProperties"));
+        VkFormatProperties fp{};
+        if (format_props) format_props(g_phys, VK_FORMAT_B8G8R8A8_UNORM, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        ok = (fp.optimalTilingFeatures & need) == need;
+        if (!ok) logf("hd: B8G8R8A8 cannot be blitted linearly: mesh twins without mipmaps");
+    }
+    return ok;
+}
+
+// A sampled image `scale` times the size of ii (with `mips` levels, the view showing them all),
+// with a view, or an empty HdImage.
+HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name, uint32_t mips = 1) {
     HdImage hd;
     hd.name = name;
+    hd.mips = mips;
     auto requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(device_fn("vkGetImageMemoryRequirements"));
     auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(device_fn("vkAllocateMemory"));
     auto bind = reinterpret_cast<PFN_vkBindImageMemory>(device_fn("vkBindImageMemory"));
@@ -2583,11 +2660,12 @@ HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = ii.format;
     ci.extent = {ii.w * scale, ii.h * scale, 1};
-    ci.mipLevels = 1;
+    ci.mipLevels = mips;
     ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               (mips > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);  // levels blitted from the one above
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (real_vkCreateImage(g_device, &ci, nullptr, &hd.image) != VK_SUCCESS) {
         hd.image = VK_NULL_HANDLE;
@@ -2604,7 +2682,7 @@ HdImage make_hd(const ImageInfo& ii, int scale, const std::string& name) {
     vi.image = hd.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = ii.format;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
     auto [block, offset] = ai.memoryTypeIndex == UINT32_MAX ? std::make_pair(-1, VkDeviceSize{0})
                                                              : block_alloc(req, ai.memoryTypeIndex);
     bool bound;
@@ -2769,8 +2847,12 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
         queue_file(std::move(job));
     }
     VkBuffer staged = st.buffer;
+    auto blit_image = reinterpret_cast<PFN_vkCmdBlitImage>(device_fn("vkCmdBlitImage"));
+    uint32_t mips = 1;
+    if (kind == HdImage::kFile && colour && g_mesh_names.count(name) && blit_image && mip_blit_ok())
+        for (uint32_t s = std::max(rp.w, rp.h); s > 1; s >>= 1) ++mips;
     double t0 = now_ms();
-    HdImage hd = make_hd(ii, g_layer_scale, name);
+    HdImage hd = make_hd(ii, g_layer_scale, name, mips);
     g_perf.image += now_ms() - t0;
     if (!hd.image) return;
     hd.kind = kind;
@@ -2781,16 +2863,40 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = hd.image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
     barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     VkBufferImageCopy reg{};
     reg.bufferOffset = st.offset;
     reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     reg.imageExtent = {rp.w, rp.h, 1};
     real_vkCmdCopyBufferToImage(cb, staged, hd.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    if (mips > 1) {  // every level from the one above, halved (linear); all end in TRANSFER_SRC
+        b.subresourceRange.levelCount = 1;
+        for (uint32_t m = 1; m <= mips; ++m) {
+            b.subresourceRange.baseMipLevel = m - 1;  // level m - 1 written: becomes a source
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            if (m == mips) break;
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m - 1, 0, 1};
+            blit.srcOffsets[1] = {std::max(1, static_cast<int32_t>(rp.w >> (m - 1))),
+                                  std::max(1, static_cast<int32_t>(rp.h >> (m - 1))), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1};
+            blit.dstOffsets[1] = {std::max(1, static_cast<int32_t>(rp.w >> m)), std::max(1, static_cast<int32_t>(rp.h >> m)), 1};
+            blit_image(cb, hd.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hd.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+        }
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    } else {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    }
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     g_hd[(uint64_t)dst] = hd;
@@ -2798,8 +2904,9 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     t.hd = hd;
     t.users = 1;
     static unsigned logged = 0;
-    if (logged++ < 100 || (depth && kind == HdImage::kFile))
-        logf("hd: img#%u %s -> %ux%u twin%s", ii.id, name.c_str(), rp.w, rp.h, kind == HdImage::kWallMask ? " (magnified)" : "");
+    if (logged++ < 100 || (depth && kind == HdImage::kFile) || mips > 1)
+        logf("hd: img#%u %s -> %ux%u twin%s", ii.id, name.c_str(), rp.w, rp.h,
+             kind == HdImage::kWallMask ? " (magnified)" : mips > 1 ? " (mesh, mipmapped)" : "");
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
@@ -2817,9 +2924,12 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffe
     uint32_t w = 0, h = 0;
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
-        if (g_trace && n)
-            logf("    copyBufferToImage -> %s %u regions, first %ux%u", img_desc((uint64_t)dst).c_str(), n,
-                 r[0].imageExtent.width, r[0].imageExtent.height);
+        if (g_trace && n) {
+            const ImageInfo* info = nullptr;  // the pixels' name too: whether an upload repeats
+            const unsigned char* p = upload_pixels(src, dst, n, r, &info);
+            logf("    copyBufferToImage -> %s %u regions, first %ux%u %s", img_desc((uint64_t)dst).c_str(), n,
+                 r[0].imageExtent.width, r[0].imageExtent.height, p ? content_name(*info, p).c_str() : "");
+        }
         if (g_dump) dump_upload(src, dst, n, r);
         auto rp = g_replace.find((uint64_t)dst);
         if (rp != g_replace.end()) {
@@ -3051,8 +3161,9 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderPass(VkCommandBuffer cb) {
     flush_partial(cb, false);
     real_vkCmdEndRenderPass(cb);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
-    if (g_trace) logf("  [end]");
     CmdState& st = g_cmd[cb];
+    if (g_trace || st.log_pass) logf("  [end]");
+    st.log_pass = false;
     st.in_pass = false;
     if (st.scale > 1) {
         st.scale = 1;
@@ -3297,6 +3408,10 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
         hd_toggle = consume_trigger("hd.toggle") || hd_toggle;
         world = consume_trigger("world.now") || world;
         bench = consume_trigger("bench.now") || bench;
+        if (consume_trigger("dump.toggle")) {
+            g_dump = !g_dump;
+            logf("== dump %s at frame %u", g_dump ? "on" : "off", g_frame);
+        }
     }
     if (bench && !g_bench) {
         g_bench = true;

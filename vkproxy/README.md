@@ -74,6 +74,10 @@ instead of the system loader. It forwards every call to the real loader
   the wall slopes fits, 45 degree and steep lines are tried. The pixels they add outside the
   game's coverage take their colour from the nearest covered pixel (`world_wall.frag`): a
   fence's wallpaper holds its background there.
+- mesh textures: the Sims (and pets, and what they hold) are 3D meshes drawn at any size, so
+  the twins of the textures listed in `<replace>/mesh.names` (`tools/hd_skins.py`) get
+  mipmaps (linear blits when the twin is made) and are drawn with a trilinear copy of the
+  game's sampler; a 3x texture shown smaller than itself would shimmer otherwise.
 - depth twins: each object sprite comes with a 1x depth texture (R8: the sprite's z, 0
   where it has no pixel, i.e. nearest). For a sprite whose HD coverage grows past the
   original (an outline rounded off by hand, `hd_art.py --install-edits`), a 3x depth
@@ -108,9 +112,10 @@ powershell -File vkproxy\build.ps1   # -> vkproxy\build\vulkan-1.dll
 Keys (only while the game window has focus): **F6** switches the in-lot sprite shaders
 (ours / the game's), **F7** benchmarks (below), **F9** toggles the HD (content-replaced)
 textures, **F10** toggles xBR, **F11** logs every render pass and draw of the next 90
-frames (time to press it and then do what is to be traced). Creating an empty file
-`world.toggle`, `bench.now`, `hd.toggle`, `xbr.toggle` or `trace.now` in the output folder
-does the same without touching the keyboard. Log and dumped shaders go to
+frames (time to press it and then do what is to be traced; each upload is logged with the
+content name of its pixels). Creating an empty file `world.toggle`, `bench.now`,
+`hd.toggle`, `xbr.toggle` or `trace.now` in the output folder does the same without
+touching the keyboard; `dump.toggle` switches `VKPROXY_DUMP` on or off. Log and dumped shaders go to
 `%VKPROXY_DIR%` (default `%TEMP%\vkproxy`).
 
 Environment variables, for testing (set before starting `Sims.exe` directly; needs
@@ -131,8 +136,9 @@ Environment variables, for testing (set before starting `Sims.exe` directly; nee
 ## Limits
 
 - In the lot, only textures with a content-replacement file change (object sprites,
-  floors, wallpapers, the tile outline cursor); fences, other wall styles and Sims are
-  drawn as the game made them.
+  floors, wallpapers, the tile outline cursor, the Sims' textures); fences and other wall
+  styles are drawn as the game made them, and so are the Sims' meshes themselves (shape,
+  edges).
 - xBR smooths edges but adds no detail (see FINDINGS).
 - Readbacks of enlarged targets are handled for `vkCmdCopyImageToBuffer` (lot thumbnails);
   `vkCmdCopyImage`/`vkCmdBlitImage` from them are only logged (not seen so far).

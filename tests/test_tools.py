@@ -23,6 +23,7 @@ import hd_floors  # noqa: E402
 import hd_translucent  # noqa: E402
 import hd_pack  # noqa: E402
 import hd_shapes  # noqa: E402
+import hd_skins  # noqa: E402
 import hd_ui  # noqa: E402
 import stairs  # noqa: E402
 import hd_walls  # noqa: E402
@@ -680,6 +681,51 @@ class HdUiTests(unittest.TestCase):
         self.assertGreater(row[0], row[-1])
         line = [hd[(1 * 3 * W + X) * 4] for X in range(W)]
         self.assertTrue(all(v == 160 for v in line))  # the line is not blurred into its neighbours
+
+
+def make_bmp24(w: int, h: int, rgb: list[tuple[int, int, int]]) -> bytes:
+    """24-bit bottom-up BMP; rgb[y * w + x] = (r, g, b), top row first."""
+    stride = (w * 3 + 3) & ~3
+    rows = [bytes(c for r, g, b in rgb[y * w:(y + 1) * w] for c in (b, g, r)).ljust(stride, b"\0")
+            for y in reversed(range(h))]
+    pixels = b"".join(rows)
+    return (b"BM" + struct.pack("<IHHI", 54 + len(pixels), 0, 0, 54)
+            + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(pixels), 0, 0, 0, 0) + pixels)
+
+
+class HdSkinsTests(unittest.TestCase):
+    def test_finds_mesh_textures_and_names_them_as_uploaded(self):
+        def tex(w, h, seed):
+            return [((x * 7 + seed) % 256, (y * 13 + seed) % 256, (x + y + seed) % 256) for y in range(h) for x in range(w)]
+
+        body, head, tiny = tex(32, 32, 1), tex(32, 64, 2), tex(16, 16, 3)
+        with tempfile.TemporaryDirectory() as d:
+            game = Path(d)
+            (game / "GameData" / "Skins").mkdir(parents=True)
+            (game / "GameData" / "Skins" / "B001body.bmp").write_bytes(make_bmp24(32, 32, body))
+            (game / "GameData" / "Skins" / "spark.bmp").write_bytes(make_bmp24(16, 16, tiny))  # too small
+            (game / "GameData" / "Textures").mkdir()
+            (game / "GameData" / "Textures" / "Textures.far").write_bytes(
+                make_far({"C001head.bmp": make_bmp24(32, 64, head), "B001copy.bmp": make_bmp24(32, 32, body)}))
+            (game / "UIGraphics").mkdir()  # UI bitmaps are not mesh textures
+            (game / "UIGraphics" / "UIGraphics.far").write_bytes(make_far({"panel.bmp": make_bmp24(32, 32, head[:1024])}))
+            (game / "GameData" / "Walls").mkdir()  # nor are BMPs outside the Skins folders
+            (game / "GameData" / "Walls" / "x.bmp").write_bytes(make_bmp24(32, 32, head[:1024]))
+            (game / "vkproxy" / "Skins").mkdir(parents=True)  # nor our own files
+            (game / "vkproxy" / "Skins" / "y.bmp").write_bytes(make_bmp24(32, 32, head[1024:]))
+            found = list(hd_skins.textures(game))
+        self.assertEqual([(w, h, where.replace("\\", "/")) for _n, w, h, _t, where in found],
+                         [(32, 32, "GameData/Skins/B001body.bmp"), (32, 64, "GameData/Textures/Textures.far/C001head.bmp")])
+        for (name, w, h, t, _where), rgb in zip(found, (body, head)):
+            self.assertEqual(t, bytes(c for r, g, b in rgb for c in (b, g, r, 255)))  # full colour
+            uploaded = bytes(c for r, g, b in rgb for c in (b & 0xF8, g & 0xFC, r & 0xF8, 255))
+            self.assertEqual(name, spr2.content_name(w, h, uploaded))  # named as Legacy uploads it
+
+    def test_names_list_grows(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(hd_skins.install_names(Path(d), ["8x8_00bb", "8x8_00aa"]), 2)
+            self.assertEqual(hd_skins.install_names(Path(d), ["8x8_00cc", "8x8_00aa"]), 3)
+            self.assertEqual((Path(d) / hd_skins.FILE).read_text(encoding="ascii"), "8x8_00aa\n8x8_00bb\n8x8_00cc\n")
 
 
 class HdPackTests(unittest.TestCase):

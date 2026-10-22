@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
+import exe_dump  # noqa: E402
 import exe_strings  # noqa: E402
 import far  # noqa: E402
 import ffn  # noqa: E402
@@ -829,6 +830,28 @@ class IffTests(unittest.TestCase):
         struct.pack_into(">I", data, 64 + 4, 9999)
         with self.assertRaises(iff.IffError):
             iff.read_iff(bytes(data))
+
+
+class ExeDumpTests(unittest.TestCase):
+    def test_sections_of_a_mapped_image(self):
+        pe = 0x80
+        image = bytearray(0x400)
+        image[:2] = b"MZ"
+        struct.pack_into("<I", image, 0x3C, pe)
+        image[pe:pe + 4] = b"PE\0\0"
+        struct.pack_into("<HH", image, pe + 4, 0x14C, 2)  # i386, 2 sections
+        struct.pack_into("<H", image, pe + 20, 0xE0)      # optional header size
+        table = pe + 24 + 0xE0
+        for i, (name, rva, size, flags) in enumerate(((b".text", 0x1000, 0x2345, 0x60000020),
+                                                      (b".data", 0x4000, 0x100, 0xC0000040))):
+            o = table + 40 * i
+            image[o:o + 8] = name.ljust(8, b"\0")
+            struct.pack_into("<II", image, o + 8, size, rva)
+            struct.pack_into("<I", image, o + 36, flags)
+        self.assertEqual(exe_dump.sections(bytes(image)),
+                         [(".text", 0x1000, 0x2345, 0x60000020), (".data", 0x4000, 0x100, 0xC0000040)])
+        with self.assertRaises(ValueError):
+            exe_dump.sections(b"ZM" + bytes(image[2:]))
 
 
 class StringsTests(unittest.TestCase):

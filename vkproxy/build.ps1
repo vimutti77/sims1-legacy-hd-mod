@@ -23,7 +23,8 @@ foreach ($shader in 'xbr', 'world_floor', 'world_wall', 'world_object', 'world_o
 & "$sdk\Bin\glslc.exe" -O -mfmt=c -o "$out\world_object_vert.inc" "$root\src\world_object.vert"
 if ($LASTEXITCODE -ne 0) { throw "shader compile failed: world_object.vert" }
 
-& $cxx -std=c++17 -O2 -Wall -shared -static -o "$out\vulkan-1.dll" "$root\src\vkproxy.cpp" `
+# frame pointers kept: log_game_stack walks them into the game's code
+& $cxx -std=c++17 -O2 -fno-omit-frame-pointer -Wall -shared -static -o "$out\vulkan-1.dll" "$root\src\vkproxy.cpp" `
     "-I$sdk\Include" "-I$out" '-Wl,--kill-at'
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 Write-Output "built $out\vulkan-1.dll"

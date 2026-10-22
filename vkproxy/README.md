@@ -115,7 +115,12 @@ textures, **F10** toggles xBR, **F11** logs every render pass and draw of the ne
 frames (time to press it and then do what is to be traced; each upload is logged with the
 content name of its pixels). Creating an empty file `world.toggle`, `bench.now`,
 `hd.toggle`, `xbr.toggle` or `trace.now` in the output folder does the same without
-touching the keyboard; `dump.toggle` switches `VKPROXY_DUMP` on or off. Log and dumped shaders go to
+touching the keyboard; `dump.toggle` switches `VKPROXY_DUMP` on or off. A `stack.sizes` file
+there (`105x41 25x25`), read at start, logs the game code behind the creation of and uploads
+into images of those sizes (return addresses as offsets from `Sims.exe`'s base, found by
+walking frame pointers), to read in a memory dump (`tools/exe_dump.py`, `tools/exe_dis.py`).
+The first two passes into every target smaller than the screen are always logged with their
+draws (what is drawn once, when a lot loads). Log and dumped shaders go to
 `%VKPROXY_DIR%` (default `%TEMP%\vkproxy`).
 
 Environment variables, for testing (set before starting `Sims.exe` directly; needs

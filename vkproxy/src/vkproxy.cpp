@@ -121,6 +121,9 @@ bool g_layer_scale_auto = true;
 int g_dpi_arg = 0;  // -dpi:N (or -dpi_N) on the game's command line, 0 if absent
 uint32_t g_swap_w = 0, g_swap_h = 0;
 bool g_dump = false;  // VKPROXY_DUMP=1: save texture uploads (see dump_upload)
+// Sizes of images whose creation is logged with the game code that asked for it (log_game_stack),
+// from <VKPROXY_DIR>\stack.sizes ("105x41 25x25"): how the Sims' portraits are made.
+std::set<std::pair<uint32_t, uint32_t>> g_stack_sizes;
 bool g_replace_on = true;  // VKPROXY_REPLACE=0 disables texture replacement
 bool g_xbr_all = true;     // VKPROXY_XBR_ALL=0: xBR only on layer composites (see xbr_twin_for)
 // World draw log (VKPROXY_WORLDLOG=1): every texture upload is named by its content
@@ -246,6 +249,11 @@ void init() {
         if (GetEnvironmentVariableA("VKPROXY_REPLACE", buf, MAX_PATH) && buf[0] == '0') g_replace_on = false;
         if (GetEnvironmentVariableA("VKPROXY_XBR_ALL", buf, MAX_PATH) && buf[0] == '0') g_xbr_all = false;
         if (GetEnvironmentVariableA("VKPROXY_WORLDLOG", buf, MAX_PATH) && buf[0] == '1') g_names_on = true;
+        if (FILE* f = fopen((g_dir + "\\stack.sizes").c_str(), "r")) {  // see log_game_stack
+            unsigned w, h;
+            while (fscanf(f, " %ux%u", &w, &h) == 2) g_stack_sizes.insert({w, h});
+            fclose(f);
+        }
         logf("settings: xbr=%d xbr_all=%d layer_scale=%s replace=%d (%s) dump=%d worldlog=%d -dpi=%d", g_xbr_on,
              g_xbr_all, g_layer_scale_auto ? "auto" : std::to_string(g_layer_scale).c_str(), g_replace_on,
              g_replace_dir.c_str(), g_dump, g_names_on, g_dpi_arg);
@@ -569,6 +577,38 @@ const char* filter_name(VkFilter f) { return f == VK_FILTER_NEAREST ? "nearest" 
 DEVICE_HOOKS(DECL_REAL)
 #undef DECL_REAL
 
+// Log the return addresses into Sims.exe of the calls that led here (as offsets from its base:
+// ASLR), to find the code behind a call in a memory dump of the game. The game keeps frame
+// pointers, and so does this DLL (build.ps1), so the chain of saved EBPs is walked. (Scanning
+// the stack for return addresses also found stale ones, of calls that had returned.)
+void log_game_stack(const char* what) {
+    static uintptr_t base = 0, end = 0;
+    if (!base) {
+        base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        end = base + nt->OptionalHeader.SizeOfImage;
+    }
+    auto tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    auto top = reinterpret_cast<uintptr_t>(tib->StackBase);
+    auto frame = reinterpret_cast<const uintptr_t*>(__builtin_frame_address(0));
+    std::string s;
+    for (unsigned n = 0; n < 40; ++n) {
+        auto f = reinterpret_cast<uintptr_t>(frame);
+        if (f & 3 || f + 8 > top) break;
+        uintptr_t ret = frame[1];
+        if (ret >= base && ret < end) {
+            char b[16];
+            snprintf(b, sizeof b, " +%x", static_cast<unsigned>(ret - base));
+            s += b;
+        }
+        auto next = reinterpret_cast<const uintptr_t*>(frame[0]);
+        if (next <= frame) break;  // frames go up the stack
+        frame = next;
+    }
+    logf("stack of %s:%s (Sims.exe at %08x)", what, s.c_str(), static_cast<unsigned>(base));
+}
+
 bool should_enlarge(const VkImageCreateInfo* ci) {
     const VkImageUsageFlags attach = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     return g_layer_scale > 1 && g_swap_w && (ci->usage & attach) && ci->imageType == VK_IMAGE_TYPE_2D &&
@@ -616,6 +656,11 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateImage(VkDevice d, const VkImageCreateI
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         ImageInfo info{g_next_image++, ci->extent.width, ci->extent.height, ci->format, ci->usage, scale};
         g_images[(uint64_t)*out] = info;
+        if (g_stack_sizes.count({ci->extent.width, ci->extent.height})) {
+            char what[64];
+            snprintf(what, sizeof what, "createImage img#%u %ux%u", info.id, info.w, info.h);
+            log_game_stack(what);
+        }
         if (!repl.empty()) {
             g_replace[(uint64_t)*out] = Replacement{repl, ci->extent.width * scale, ci->extent.height * scale};
             logf("createImage img#%u %ux%u sampled -> replaced by %s", info.id, info.w, info.h, repl.c_str());
@@ -2931,6 +2976,13 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffe
                  r[0].imageExtent.width, r[0].imageExtent.height, p ? content_name(*info, p).c_str() : "");
         }
         if (g_dump) dump_upload(src, dst, n, r);
+        auto stacked = g_stack_sizes.empty() ? g_images.end() : g_images.find((uint64_t)dst);
+        if (stacked != g_images.end() && g_stack_sizes.count({stacked->second.w, stacked->second.h})) {
+            char what[64];
+            snprintf(what, sizeof what, "upload into img#%u %ux%u", stacked->second.id, stacked->second.w,
+                     stacked->second.h);
+            log_game_stack(what);
+        }
         auto rp = g_replace.find((uint64_t)dst);
         if (rp != g_replace.end()) {
             staged = staging_for(rp->second);

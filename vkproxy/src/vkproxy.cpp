@@ -2967,8 +2967,9 @@ std::string portrait_match(const std::string& name, const ImageInfo& ii) {
     double err = best / per, next_err = next == UINT64_MAX ? 1e9 : next / per;
     bool close = err <= lib->second.max_error && next_err - err >= lib->second.margin;
     std::string file = close && g_hd_names.count(found) ? found : "";
-    logf("portrait: %s is closest to %s (error %.1f, the next %.1f; %.1f ms)%s", name.c_str(), found, err,
-         next == UINT64_MAX ? 0.0 : next_err, now_ms() - t0, file.empty() ? ": not sure enough, kept" : "");
+    if (!file.empty() || err <= 2 * lib->second.max_error)  // not icons that merely share a size
+        logf("portrait: %s is closest to %s (error %.1f, the next %.1f; %.1f ms)%s", name.c_str(), found, err,
+             next == UINT64_MAX ? 0.0 : next_err, now_ms() - t0, file.empty() ? ": not sure enough, kept" : "");
     g_portrait_match[name] = file;
     return file;
 }

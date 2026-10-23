@@ -109,6 +109,7 @@ const unsigned kTraceFrames = 90;  // ~1.5 s: time to press F11 and then do what
 const unsigned kFirstPasses = 2;   // passes logged per small target image (begin_pass)
 bool g_xbr_on = true;
 bool g_hd_on = true;  // F9 / hd.toggle: draw with HD twins (content replacement)
+bool g_hd_1x = false;  // VKPROXY_HD1X=1: HD twins at UI scale 1 too (1080p and below), from the 3x files
 bool g_world_on = true;  // F6 / world.toggle, VKPROXY_WORLDFIX=0: the world shader twins (kWorldShaders)
 unsigned g_xbr_draws = 0;  // substituted draws in the current frame
 // Layer enlargement (step 1b): render targets smaller than the swapchain are
@@ -255,6 +256,7 @@ void init() {
         g_log = fopen((g_dir + "\\vkproxy.log").c_str(), "w");
         if (GetEnvironmentVariableA("VKPROXY_XBR", buf, MAX_PATH) && buf[0] == '0') g_xbr_on = false;
         if (GetEnvironmentVariableA("VKPROXY_WORLDFIX", buf, MAX_PATH) && buf[0] == '0') g_world_on = false;
+        if (GetEnvironmentVariableA("VKPROXY_HD1X", buf, MAX_PATH) && buf[0] == '1') g_hd_1x = true;
         if (GetEnvironmentVariableA("VKPROXY_LAYER_SCALE", buf, MAX_PATH)) {
             g_layer_scale = std::min(std::max(atoi(buf), 1), 4);
             g_layer_scale_auto = false;
@@ -269,9 +271,9 @@ void init() {
             while (fscanf(f, " %ux%u", &w, &h) == 2) g_stack_sizes.insert({w, h});
             fclose(f);
         }
-        logf("settings: xbr=%d xbr_all=%d layer_scale=%s replace=%d (%s) dump=%d worldlog=%d -dpi=%d", g_xbr_on,
-             g_xbr_all, g_layer_scale_auto ? "auto" : std::to_string(g_layer_scale).c_str(), g_replace_on,
-             g_replace_dir.c_str(), g_dump, g_names_on, g_dpi_arg);
+        logf("settings: xbr=%d xbr_all=%d layer_scale=%s replace=%d (%s) dump=%d worldlog=%d hd1x=%d -dpi=%d",
+             g_xbr_on, g_xbr_all, g_layer_scale_auto ? "auto" : std::to_string(g_layer_scale).c_str(), g_replace_on,
+             g_replace_dir.c_str(), g_dump, g_names_on, g_hd_1x, g_dpi_arg);
         GetSystemDirectoryA(buf, MAX_PATH);  // SysWOW64 for a 32-bit process
         strcat(buf, "\\vulkan-1.dll");
         g_real = LoadLibraryA(buf);
@@ -468,6 +470,10 @@ std::unordered_map<std::string, Packed> g_packed;  // "<name>@<scale>.<ext>" -> 
 std::vector<HANDLE> g_pack_files;
 std::set<std::pair<uint32_t, uint32_t>> g_hd_sizes;        // sizes worth hashing
 std::set<std::pair<uint32_t, uint32_t>> g_z_sizes;         // the same for depth textures (R8)
+// The HD files are made at 3x, for 2160p. At another UI scale (1440p: 2, 2880p: 4) the twins are
+// made from them, scaled as they are read (rescale), unless files of that scale exist too.
+const int kFileScale = 3;
+std::unordered_map<std::string, unsigned> g_name_scales;  // content name -> bit s set when a file @s exists
 // The Sims' portraits (pictures stored in the character files, portraits/build.py): a Sim made
 // or changed brings new ones, which get HD pictures while the game runs. <replace>/portraits.auto
 // names their sizes (looked up on disk when they have no file: new loose files), the size that
@@ -2204,6 +2210,51 @@ Staging load_staging(const Replacement& rp) {
 
 // src (w/s x h/s texels of bpp bytes) magnified s times, nearest, into dst (w x h): each row
 // magnified once, then copied s times (dst may be a write-combined mapping).
+// A texture's file made `from` times the game's w1 x h1, made `to` times instead: each pixel the
+// area-weighted mean of the file's pixels under it (premultiplied colour, so edges average right),
+// or for a depth texture (one byte a texel) the one at its centre. A texel of the game's stays
+// to x to pixels: nothing spills into the next one (coverage must not grow, see hd_composite).
+void rescale(const unsigned char* src, uint32_t w1, uint32_t h1, uint32_t bpp, uint32_t from, uint32_t to,
+             unsigned char* dst) {
+    uint32_t sw = w1 * from, sh = h1 * from, dw = w1 * to, dh = h1 * to;
+    if (bpp == 1) {
+        for (uint32_t y = 0; y < dh; ++y) {
+            uint32_t sy = (2 * y + 1) * from / (2 * to);
+            for (uint32_t x = 0; x < dw; ++x) dst[1ull * y * dw + x] = src[1ull * sy * sw + (2 * x + 1) * from / (2 * to)];
+        }
+        return;
+    }
+    // along an axis, per pixel: the file pixels it covers, with the overlap in 1/to of a file pixel
+    struct Tap {
+        uint32_t at, weight;
+    };
+    auto taps = [&](uint32_t n) {
+        std::vector<std::vector<Tap>> t(n);
+        for (uint32_t o = 0; o < n; ++o) {
+            uint32_t a = o * from, b = (o + 1) * from;  // the pixel's span, in the same units
+            for (uint32_t i = a / to; i * to < b; ++i) t[o].push_back({i, std::min(b, (i + 1) * to) - std::max(a, i * to)});
+        }
+        return t;
+    };
+    auto tx = taps(dw), ty = taps(dh);
+    std::vector<float> rows(1ull * dw * sh * bpp);  // across first, then down
+    for (uint32_t y = 0; y < sh; ++y)
+        for (uint32_t x = 0; x < dw; ++x)
+            for (uint32_t c = 0; c < bpp; ++c) {
+                float acc = 0;
+                for (auto& t : tx[x]) acc += static_cast<float>(t.weight) * src[(1ull * y * sw + t.at) * bpp + c];
+                rows[(1ull * y * dw + x) * bpp + c] = acc / static_cast<float>(from);
+            }
+    for (uint32_t y = 0; y < dh; ++y)
+        for (uint32_t x = 0; x < dw; ++x)
+            for (uint32_t c = 0; c < bpp; ++c) {
+                float acc = 0;
+                for (auto& t : ty[y]) acc += static_cast<float>(t.weight) * rows[(1ull * t.at * dw + x) * bpp + c];
+                dst[(1ull * y * dw + x) * bpp + c] =
+                    static_cast<unsigned char>(std::min(255.0f, acc / static_cast<float>(from) + 0.5f));
+            }
+}
+
 void magnify(unsigned char* dst, const unsigned char* src, uint32_t w, uint32_t h, uint32_t bpp, uint32_t s) {
     uint32_t w1 = w / s, row = w * bpp;
     std::vector<unsigned char> line(row);
@@ -2314,6 +2365,7 @@ struct FileJob {
     uint32_t w = 0, h = 0, bpp = 4;    // the file's (scaled) size
     bool wall = false;
     const Packed* packed = nullptr;    // in a pack: read from there, not from path
+    uint32_t from = 0;                 // the file's scale when not g_layer_scale: rescaled as read
 };
 std::mutex g_jobs_mu;
 std::condition_variable g_jobs_cv, g_jobs_done;
@@ -2329,23 +2381,28 @@ const unsigned kFileWorkers = 16;
 // repeated bottom row) come from the game and the result is opaque like the game's. A file
 // that cannot be read leaves the game's own pixels, magnified.
 bool read_job(FileJob& j) {
+    uint32_t s = static_cast<uint32_t>(g_layer_scale);
     std::vector<unsigned char> px(1ull * j.w * j.h * j.bpp);
+    bool rescaled = j.from && j.from != s;
+    std::vector<unsigned char> file;  // the file's pixels when they are rescaled
+    std::vector<unsigned char>& into = rescaled ? file : px;
+    if (rescaled) file.resize(1ull * (j.w / s * j.from) * (j.h / s * j.from) * j.bpp);
     size_t got = 0;
     if (j.packed) {  // positional reads on a shared handle: safe from several threads
         OVERLAPPED ov{};
         ov.Offset = static_cast<DWORD>(j.packed->offset);
         ov.OffsetHigh = static_cast<DWORD>(j.packed->offset >> 32);
         DWORD n = 0;
-        if (j.packed->size == px.size() && ReadFile(j.packed->file, px.data(), j.packed->size, &n, &ov)) got = n;
+        if (j.packed->size == into.size() && ReadFile(j.packed->file, into.data(), j.packed->size, &n, &ov)) got = n;
     } else if (FILE* f = fopen(j.path.c_str(), "rb")) {
-        got = fread(px.data(), 1, px.size(), f);
+        got = fread(into.data(), 1, into.size(), f);
         fclose(f);
     }
-    uint32_t s = static_cast<uint32_t>(g_layer_scale);
-    if (got != px.size()) {
+    if (got != into.size()) {
         magnify(j.dst, j.under.data(), j.w, j.h, j.bpp, s);
         return false;
     }
+    if (rescaled) rescale(file.data(), j.w / s, j.h / s, j.bpp, j.from, s, px.data());
     if (j.wall)  // composed in cached memory, then copied: the mapping is write-combined
         for (uint32_t y = 0; y < j.h; ++y)
             for (uint32_t x = 0; x < j.w; ++x) {
@@ -2556,14 +2613,22 @@ Staging twin_staging(VkDeviceSize size, void** ptr) {
     return st;
 }
 
-// A content replacement file name for this scale, <w>x<h>_<hash>@<scale>.bgra (sprites),
-// <w>x<h>_<hash>_f9@<scale>.raw (sprite depth textures, R8) or <w>x<h>_<hash>_w<mask>@<scale>.bgra
-// (walls), goes into g_hd_names; true if it is one.
+// A content replacement file name for this scale or the files' (kFileScale), <w>x<h>_<hash>@<scale>.bgra
+// (sprites), <w>x<h>_<hash>_f9@<scale>.raw (sprite depth textures, R8) or
+// <w>x<h>_<hash>_w<mask>@<scale>.bgra (walls), goes into g_hd_names; true if it is one.
 bool index_file(const std::string& n) {
-    std::string bgra = "@" + std::to_string(g_layer_scale) + ".bgra", raw = "@" + std::to_string(g_layer_scale) + ".raw";
     auto ends = [&](const std::string& e) { return n.size() > e.size() && !n.compare(n.size() - e.size(), e.size(), e); };
-    bool depth = ends(raw);
-    if (!depth && !ends(bgra)) return false;
+    bool depth = false;
+    int scale = 0;
+    for (int sc : {g_layer_scale, kFileScale}) {
+        std::string bgra = "@" + std::to_string(sc) + ".bgra", raw = "@" + std::to_string(sc) + ".raw";
+        if (ends(raw) || ends(bgra)) {
+            depth = ends(raw);
+            scale = sc;
+            break;
+        }
+    }
+    if (!scale) return false;
     size_t at = n.rfind('@');
     unsigned w = 0, h = 0;
     char hash[17] = {};
@@ -2574,8 +2639,15 @@ bool index_file(const std::string& n) {
                 rest.find_first_not_of("0123456789", 2) == std::string::npos;
     if (n.compare(0, base.size(), base) != 0 || !(rest == (depth ? "_f9" : "") || wall)) return false;
     g_hd_names.insert(n.substr(0, at));
+    g_name_scales[n.substr(0, at)] |= 1u << scale;
     if (!wall) (depth ? g_z_sizes : g_hd_sizes).insert({w, h});
     return true;
+}
+
+// The scale of the file to make a twin of this content from: this scale's when there is one.
+int file_scale(const std::string& name) {
+    auto sc = g_name_scales.find(name);
+    return sc != g_name_scales.end() && (sc->second & (1u << g_layer_scale)) ? g_layer_scale : kFileScale;
 }
 
 // One pack's index (format: tools/hd_pack.py) into g_packed; the pack stays open.
@@ -3030,11 +3102,13 @@ void late_lookup(const std::string& name, std::pair<uint32_t, uint32_t> size) {
         g_late.missing.clear();  // look again
     }
     if (g_late.missing.count(name)) return;
-    std::string file = name + "@" + std::to_string(g_layer_scale) + ".bgra";
-    if (GetFileAttributesA((g_replace_dir + "\\" + file).c_str()) != INVALID_FILE_ATTRIBUTES && index_file(file)) {
-        g_packed.erase(file);  // loose wins
-        logf("hd: %s made while the game runs", file.c_str());
-        return;
+    for (int sc : {g_layer_scale, kFileScale}) {
+        std::string file = name + "@" + std::to_string(sc) + ".bgra";
+        if (GetFileAttributesA((g_replace_dir + "\\" + file).c_str()) != INVALID_FILE_ATTRIBUTES && index_file(file)) {
+            g_packed.erase(file);  // loose wins
+            logf("hd: %s made while the game runs", file.c_str());
+            return;
+        }
     }
     g_late.missing.insert(name);
     if (size == g_late.trigger && !g_late.command.empty() && !g_late.builder && started_for.insert(name).second)
@@ -3091,7 +3165,7 @@ std::string portrait_match(const std::string& name, const ImageInfo& ii) {
 // For each upload into a sampled texture: when its pixels have a replacement
 // file, record (into cb, after the game's own copy) the fill of an HD twin.
 void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy* r) {
-    if (g_layer_scale < 2 || !g_replace_on || !g_swap_w) return;
+    if ((g_layer_scale < 2 && !g_hd_1x) || !g_replace_on || !g_swap_w) return;
     if (!g_hd_scanned) scan_hd_files();
     auto existing = g_hd.find((uint64_t)dst);
     if (g_hd_names.empty() && existing == g_hd.end()) return;
@@ -3101,8 +3175,9 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
     const ImageInfo* info = nullptr;
     bool depth = im->second.format == VK_FORMAT_R8_UNORM;  // a sprite's depth texture
     bool colour = im->second.format == VK_FORMAT_B8G8R8A8_UNORM;
-    auto wall = colour ? g_wall_masks.find({im->second.w, im->second.h}) : g_wall_masks.end();
-    bool wall_mask = depth && g_wall_masks.count({im->second.w, im->second.h});  // same size as its wall
+    bool walls = g_layer_scale > 1;  // at 1x a wall's twin would add nothing
+    auto wall = colour && walls ? g_wall_masks.find({im->second.w, im->second.h}) : g_wall_masks.end();
+    bool wall_mask = depth && walls && g_wall_masks.count({im->second.w, im->second.h});  // same size as its wall
     if (wall != g_wall_masks.end() && n) {  // every upload into a wall-sized image, whole or not
         static unsigned logged = 0;
         if (logged++ < 300)
@@ -3164,9 +3239,9 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
         }
     }
     const ImageInfo& ii = *info;
+    int from = file.empty() ? g_layer_scale : file_scale(file);
     Replacement rp{file.empty() ? std::string()
-                                : g_replace_dir + "\\" + file + "@" + std::to_string(g_layer_scale) +
-                                      (depth ? ".raw" : ".bgra"),
+                                : g_replace_dir + "\\" + file + "@" + std::to_string(from) + (depth ? ".raw" : ".bgra"),
                    ii.w * g_layer_scale, ii.h * g_layer_scale, texel_size(ii.format)};
     auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(device_fn("vkCmdPipelineBarrier"));
     if (!barrier) return;
@@ -3180,6 +3255,7 @@ void hd_upload(VkCommandBuffer cb, VkBuffer src, VkImage dst, uint32_t n, const 
         magnify(static_cast<unsigned char*>(mapped), g_name_buf.data(), rp.w, rp.h, rp.bpp, g_layer_scale);
     else {  // filled before the next submit (wait_files)
         FileJob job{rp.path, static_cast<unsigned char*>(mapped), g_name_buf, rp.w, rp.h, rp.bpp, kind == HdImage::kWall};
+        job.from = static_cast<uint32_t>(from);
         auto packed = g_packed.find(rp.path.substr(g_replace_dir.size() + 1));
         if (packed != g_packed.end()) job.packed = &packed->second;
         queue_file(std::move(job));
@@ -3545,7 +3621,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateSwapchainKHR(VkDevice d, const VkSwapc
             g_layer_scale = std::min(s, 4);
         }
         // the HD files' index, now that the scale is known (still on the loading screen)
-        if (!g_hd_scanned && g_replace_on && g_layer_scale >= 2) scan_hd_files();
+        if (!g_hd_scanned && g_replace_on && (g_layer_scale >= 2 || g_hd_1x)) scan_hd_files();
     }
     logf("createSwapchain %ux%u fmt%d images>=%u (layer scale %d)", ci->imageExtent.width, ci->imageExtent.height,
          static_cast<int>(ci->imageFormat), ci->minImageCount, g_layer_scale);

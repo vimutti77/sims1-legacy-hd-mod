@@ -36,6 +36,11 @@ instead of the system loader. It forwards every call to the real loader
   `tools/stairs.py` does for the HD wall tops that sit on them); the shader multiplies the
   wall's colour by the mask, so the edges come out soft. A wall-sized upload with no HD
   wallpaper (a fence, custom content) gets the upload magnified so its mask can go with it.
+- other UI scales: the HD files are made at 3x (2160p). At another UI scale (1440p and
+  1600p: 2; 2880p: 4) the twins are made from them, rescaled as they are read (area-weighted
+  mean of premultiplied pixels, a 1x texel staying whole; depth textures nearest), unless
+  files of that scale exist. Font atlases are built per scale (`tools/font_atlas.py
+  --scale N`). At scale 1 (1080p and below) there are no HD twins unless `VKPROXY_HD1X=1`.
 - replacement files are read from packs (`tools/hd_pack.py`: a few 1 GB files with an
   index) opened while the game loads; a loose file in `replace\` wins over a packed one.
   Reads run on 16 threads and are waited for before the next `vkQueueSubmit`. Staging (a
@@ -149,6 +154,7 @@ Environment variables, for testing (set before starting `Sims.exe` directly; nee
 | `VKPROXY_LAYER_SCALE=N` | render UI windows at N× instead of the game's UI scale; `1` = off |
 | `VKPROXY_REPLACE=0` | don't replace textures (HD font atlases) |
 | `VKPROXY_WORLDFIX=0` | start with the game's own in-lot sprite shaders (F6 switches) |
+| `VKPROXY_HD1X=1` | HD twins at UI scale 1 too (1080p and below; made from the 3x files, no wall twins): to judge whether it is worth it |
 | `VKPROXY_WARMUP=0` | don't open the loose replacement files in the background at start |
 | `VKPROXY_DIR=<folder>` | log, shader dumps and `replace\` go here |
 | `VKPROXY_DUMP=1` | save every texture upload to `dump\` |

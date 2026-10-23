@@ -50,6 +50,15 @@
 
 namespace {
 
+// The release build for players (build.ps1 -Release): no hotkeys or trigger files, no VKPROXY_*
+// settings, no shader dumps, stack logging or portraits builder, and a log of what matters to
+// a report (the settings, the HD files found, warnings and errors).
+#ifdef VKPROXY_RELEASE
+constexpr bool kRelease = true;
+#else
+constexpr bool kRelease = false;
+#endif
+
 const uint32_t kXbrFrag[] =
 #include "xbr_frag.inc"
     ;
@@ -204,8 +213,16 @@ struct GpuTimer {
     bool failed = false;
 } g_gpu;
 
+// What a release build logs (see kRelease), by the start of the message.
+bool logged_in_release(const char* fmt) {
+    for (const char* kept : {"ERROR", "WARNING", "settings", "vkproxy loaded", "hd: %u content", "createSwapchain",
+                             "replace: %u file reader"})
+        if (!strncmp(fmt, kept, strlen(kept))) return true;
+    return false;
+}
+
 void logf(const char* fmt, ...) {
-    if (!g_log) return;
+    if (!g_log || (kRelease && !logged_in_release(fmt))) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
     fprintf(g_log, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
@@ -241,7 +258,7 @@ void init() {
     static std::once_flag once;
     std::call_once(once, [] {
         char buf[MAX_PATH];
-        DWORD n = GetEnvironmentVariableA("VKPROXY_DIR", buf, MAX_PATH);
+        DWORD n = kRelease ? 0 : GetEnvironmentVariableA("VKPROXY_DIR", buf, MAX_PATH);
         bool dir_set = n > 0 && n < MAX_PATH;
         if (!dir_set) {
             GetTempPathA(MAX_PATH, buf);
@@ -254,19 +271,20 @@ void init() {
         g_ms_per_tick = 1000.0 / static_cast<double>(freq.QuadPart);
         CreateDirectoryA(g_dir.c_str(), nullptr);
         g_log = fopen((g_dir + "\\vkproxy.log").c_str(), "w");
-        if (GetEnvironmentVariableA("VKPROXY_XBR", buf, MAX_PATH) && buf[0] == '0') g_xbr_on = false;
-        if (GetEnvironmentVariableA("VKPROXY_WORLDFIX", buf, MAX_PATH) && buf[0] == '0') g_world_on = false;
-        if (GetEnvironmentVariableA("VKPROXY_HD1X", buf, MAX_PATH) && buf[0] == '1') g_hd_1x = true;
-        if (GetEnvironmentVariableA("VKPROXY_LAYER_SCALE", buf, MAX_PATH)) {
+        auto env = [&](const char* name) { return !kRelease && GetEnvironmentVariableA(name, buf, MAX_PATH); };
+        if (env("VKPROXY_XBR") && buf[0] == '0') g_xbr_on = false;
+        if (env("VKPROXY_WORLDFIX") && buf[0] == '0') g_world_on = false;
+        if (env("VKPROXY_HD1X") && buf[0] == '1') g_hd_1x = true;
+        if (env("VKPROXY_LAYER_SCALE")) {
             g_layer_scale = std::min(std::max(atoi(buf), 1), 4);
             g_layer_scale_auto = false;
         }
         g_dpi_arg = dpi_argument(GetCommandLineA());
-        if (GetEnvironmentVariableA("VKPROXY_DUMP", buf, MAX_PATH) && buf[0] == '1') g_dump = true;
-        if (GetEnvironmentVariableA("VKPROXY_REPLACE", buf, MAX_PATH) && buf[0] == '0') g_replace_on = false;
-        if (GetEnvironmentVariableA("VKPROXY_XBR_ALL", buf, MAX_PATH) && buf[0] == '0') g_xbr_all = false;
-        if (GetEnvironmentVariableA("VKPROXY_WORLDLOG", buf, MAX_PATH) && buf[0] == '1') g_names_on = true;
-        if (FILE* f = fopen((g_dir + "\\stack.sizes").c_str(), "r")) {  // see log_game_stack
+        if (env("VKPROXY_DUMP") && buf[0] == '1') g_dump = true;
+        if (env("VKPROXY_REPLACE") && buf[0] == '0') g_replace_on = false;
+        if (env("VKPROXY_XBR_ALL") && buf[0] == '0') g_xbr_all = false;
+        if (env("VKPROXY_WORLDLOG") && buf[0] == '1') g_names_on = true;
+        if (FILE* f = kRelease ? nullptr : fopen((g_dir + "\\stack.sizes").c_str(), "r")) {  // see log_game_stack
             unsigned w, h;
             while (fscanf(f, " %ux%u", &w, &h) == 2) g_stack_sizes.insert({w, h});
             fclose(f);
@@ -847,7 +865,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateShaderModule(VkDevice d, const VkShade
         char name[64];
         snprintf(name, sizeof name, "shader_%016llx.spv", static_cast<unsigned long long>(h));
         std::string path = g_dir + "\\" + name;
-        if (FILE* f = fopen(path.c_str(), "wb")) {
+        if (FILE* f = kRelease ? nullptr : fopen(path.c_str(), "wb")) {
             fwrite(ci->pCode, 1, ci->codeSize, f);
             fclose(f);
         }
@@ -1894,31 +1912,55 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdClearAttachments(VkCommandBuffer cb, uint32_t
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
                                              VkImageLayout dl, uint32_t n, const VkImageCopy* r) {
+    std::vector<VkImageCopy> big;
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         if (g_trace && n)
             logf("    copyImage %s -> %s %u regions, first %ux%u", img_desc((uint64_t)src).c_str(),
                  img_desc((uint64_t)dst).c_str(), n, r[0].extent.width, r[0].extent.height);
-        warn_if_enlarged("copyImage src", (uint64_t)src);
-        warn_if_enlarged("copyImage dst", (uint64_t)dst);
         static unsigned logged = 0;
         if (g_hd.count((uint64_t)dst) && logged++ < 50)  // its HD twin would now be stale
             logf("copyImage into %s, which has an HD twin, frame %u", img_desc((uint64_t)dst).c_str(), g_frame);
+        const int s = image_scale((uint64_t)src);
+        if (s > 1 && s == image_scale((uint64_t)dst)) {  // both enlarged alike: copy the whole enlarged area
+            big.assign(r, r + n);
+            for (VkImageCopy& c : big) {
+                c.srcOffset.x *= s, c.srcOffset.y *= s;
+                c.dstOffset.x *= s, c.dstOffset.y *= s;
+                c.extent.width *= s, c.extent.height *= s;
+            }
+        } else {
+            warn_if_enlarged("copyImage src", (uint64_t)src);
+            warn_if_enlarged("copyImage dst", (uint64_t)dst);
+        }
     }
-    real_vkCmdCopyImage(cb, src, sl, dst, dl, n, r);
+    real_vkCmdCopyImage(cb, src, sl, dst, dl, n, big.empty() ? r : big.data());
 }
 
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
                                              VkImageLayout dl, uint32_t n, const VkImageBlit* r, VkFilter f) {
+    std::vector<VkImageBlit> big;
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         if (g_trace && n)
             logf("    blitImage %s -> %s %u regions", img_desc((uint64_t)src).c_str(), img_desc((uint64_t)dst).c_str(),
                  n);
-        warn_if_enlarged("blitImage src", (uint64_t)src);
-        warn_if_enlarged("blitImage dst", (uint64_t)dst);
+        // A blit scales anyway, so each side's corners just follow its own image's scale.
+        const int ss = image_scale((uint64_t)src), ds = image_scale((uint64_t)dst);
+        if (ss > 1 || ds > 1) {
+            big.assign(r, r + n);
+            for (VkImageBlit& b : big)
+                for (int k = 0; k < 2; ++k) {
+                    b.srcOffsets[k].x *= ss, b.srcOffsets[k].y *= ss;
+                    b.dstOffsets[k].x *= ds, b.dstOffsets[k].y *= ds;
+                }
+            static unsigned logged = 0;
+            if (logged++ < 5)
+                logf("blitImage %s -> %s rescaled, frame %u", img_desc((uint64_t)src).c_str(),
+                     img_desc((uint64_t)dst).c_str(), g_frame);
+        }
     }
-    real_vkCmdBlitImage(cb, src, sl, dst, dl, n, r, f);
+    real_vkCmdBlitImage(cb, src, sl, dst, dl, n, big.empty() ? r : big.data(), f);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL hk_vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
@@ -2531,7 +2573,7 @@ void start_warmup() {
     static bool started = false;
     char buf[8];
     if (started || !g_replace_on ||
-        (GetEnvironmentVariableA("VKPROXY_WARMUP", buf, sizeof buf) && buf[0] == '0'))
+        (!kRelease && GetEnvironmentVariableA("VKPROXY_WARMUP", buf, sizeof buf) && buf[0] == '0'))
         return;
     started = true;
     if (HANDLE t = CreateThread(nullptr, 0, warm_start, nullptr, 0, nullptr)) CloseHandle(t);
@@ -2742,7 +2784,7 @@ void scan_hd_files() {
         logf("hd: %u mostly see-through sprites listed", static_cast<unsigned>(g_translucent.size()));
     if (read_names("mesh.names", g_mesh_names))
         logf("hd: %u mesh textures listed", static_cast<unsigned>(g_mesh_names.size()));
-    if (FILE* f = fopen((g_replace_dir + "\\portraits.auto").c_str(), "rb")) {  // see LateFiles
+    if (FILE* f = kRelease ? nullptr : fopen((g_replace_dir + "\\portraits.auto").c_str(), "rb")) {  // see LateFiles
         char line[2048];
         while (fgets(line, sizeof line, f)) {
             std::string l(line);
@@ -3837,15 +3879,15 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
     // Hotkeys only count while the game window has focus; automation uses the
     // trigger files instead (checked twice a second at 60 fps).
     DWORD pid = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-    bool focused = pid == GetCurrentProcessId();
+    if (!kRelease) GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    bool focused = pid == GetCurrentProcessId();  // never in a release build: no hotkeys
     bool toggle = (GetAsyncKeyState(VK_F10) & 1) && focused;
     bool trace = (GetAsyncKeyState(VK_F11) & 1) && focused;
     bool hd_toggle = (GetAsyncKeyState(VK_F9) & 1) && focused;
     bool world = (GetAsyncKeyState(VK_F8) & 1) && focused;
     bool bench = (GetAsyncKeyState(VK_F7) & 1) && focused;
     bool world_toggle = (GetAsyncKeyState(VK_F6) & 1) && focused;
-    if (g_frame % 30 == 0) {
+    if (!kRelease && g_frame % 30 == 0) {
         world_toggle = consume_trigger("world.toggle") || world_toggle;
         toggle = consume_trigger("xbr.toggle") || toggle;
         trace = consume_trigger("trace.now") || trace;

@@ -1,8 +1,11 @@
 # Build vkproxy\build\vulkan-1.dll (32-bit) with llvm-mingw and the Vulkan SDK headers.
-# Usage: powershell -File vkproxy\build.ps1
+# Usage: powershell -File vkproxy\build.ps1            (the development build)
+#        powershell -File vkproxy\build.ps1 -Release   (for players, vkproxy\build-release\vulkan-1.dll:
+#                                                       no hotkeys, trigger files, VKPROXY_* settings or dumps)
+param([switch]$Release)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$out = Join-Path $root 'build'
+$out = Join-Path $root $(if ($Release) { 'build-release' } else { 'build' })
 New-Item -ItemType Directory -Force $out | Out-Null
 
 $sdk = $env:VULKAN_SDK
@@ -24,7 +27,8 @@ foreach ($shader in 'xbr', 'world_floor', 'world_wall', 'world_object', 'world_o
 if ($LASTEXITCODE -ne 0) { throw "shader compile failed: world_object.vert" }
 
 # frame pointers kept: log_game_stack walks them into the game's code
-& $cxx -std=c++17 -O2 -fno-omit-frame-pointer -Wall -shared -static -o "$out\vulkan-1.dll" "$root\src\vkproxy.cpp" `
-    "-I$sdk\Include" "-I$out" '-Wl,--kill-at'
+$defines = @(if ($Release) { '-DVKPROXY_RELEASE' })
+& $cxx -std=c++17 -O2 -fno-omit-frame-pointer -Wall -shared -static @defines -o "$out\vulkan-1.dll" `
+    "$root\src\vkproxy.cpp" "-I$sdk\Include" "-I$out" '-Wl,--kill-at'
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 Write-Output "built $out\vulkan-1.dll"

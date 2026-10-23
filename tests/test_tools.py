@@ -28,6 +28,7 @@ import hd_skins  # noqa: E402
 import hd_ui  # noqa: E402
 import stairs  # noqa: E402
 import hd_walls  # noqa: E402
+import release  # noqa: E402
 import inventory  # noqa: E402
 import skn  # noqa: E402
 import spr1  # noqa: E402
@@ -921,6 +922,25 @@ class InventoryTests(unittest.TestCase):
             self.assertIn("FAR archive", report)
             self.assertIn("Sims.exe", report)
             self.assertIn("UIGraphics", report)
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_library_names(self):
+        # portraits.lib as portraits/library.py writes it: two kinds, heads with ids
+        kinds = [(2, 1, [0x1234, 0xABCDEF0123456789]), (1, 1, [0x1])]
+        data = b"PLIB" + struct.pack("<II", 2, len(kinds))
+        for w, h, ids in kinds:
+            data += struct.pack("<IIIff", w, h, len(ids), 10.0, 2.0)
+            for i in ids:
+                data += struct.pack("<Q", i) + bytes(w * h * 4)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "portraits.lib"
+            path.write_bytes(data)
+            self.assertEqual(release.library_names(path),
+                             {"2x1_0000000000001234", "2x1_abcdef0123456789", "1x1_0000000000000001"})
+            path.write_bytes(b"NOPE" + data[4:])
+            with self.assertRaises(ValueError):
+                release.library_names(path)
 
 
 if __name__ == "__main__":

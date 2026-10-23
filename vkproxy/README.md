@@ -120,8 +120,13 @@ scene (e.g. once with F9 HD on, once off).
 Needs the Vulkan SDK (headers + `glslc`) and llvm-mingw (`i686-w64-mingw32-clang++`).
 
 ```powershell
-powershell -File vkproxy\build.ps1   # -> vkproxy\build\vulkan-1.dll
+powershell -File vkproxy\build.ps1            # -> vkproxy\build\vulkan-1.dll (development)
+powershell -File vkproxy\build.ps1 -Release   # -> vkproxy\build-release\vulkan-1.dll (players)
 ```
+
+The release build (`VKPROXY_RELEASE`, `kRelease`) has no hotkeys, trigger files or `VKPROXY_*`
+settings, dumps no shaders, runs no portraits builder, and logs only the settings, the HD files
+found, warnings and errors. `tools/release.py` ships it.
 
 ## Use
 
@@ -167,7 +172,9 @@ Environment variables, for testing (set before starting `Sims.exe` directly; nee
   styles are drawn as the game made them, and so are the Sims' meshes themselves (shape,
   edges).
 - xBR smooths edges but adds no detail (see FINDINGS).
-- Readbacks of enlarged targets are handled for `vkCmdCopyImageToBuffer` (lot thumbnails);
-  `vkCmdCopyImage`/`vkCmdBlitImage` from them are only logged (not seen so far).
+- Readbacks of enlarged targets are handled for `vkCmdCopyImageToBuffer` (lot thumbnails).
+  `vkCmdBlitImage` scales each side's corners by its own image's scale (seen once: 600x600 to
+  600x600, both enlarged); `vkCmdCopyImage` does so when both images share a scale and only
+  logs otherwise.
 - The textured-quad shader is matched by SPIR-V hash (`kQuadFragShader`); a game update
   that changes that shader disables the effect (the game still runs).

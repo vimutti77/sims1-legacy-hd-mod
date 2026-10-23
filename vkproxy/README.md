@@ -55,7 +55,9 @@ instead of the system loader. It forwards every call to the real loader
   (draws with the same vertex depths in the pass) comes in as firstInstance and brings it
   a hair forward, so exact depth ties go to the later draw in both passes. Ranks are the
   game's order within the band as last seen in order (the game moves the object under the
-  cursor, or just put down, to the end of its list), and sprites listed in
+  cursor, or just put down, to the end of its list; a draw is found again by its texture and
+  position, or else by how many draws of its texture came before it in the band, which
+  scrolling leaves alone), and sprites listed in
   `<replace>/translucent.names` (`tools/hd_translucent.py`: mostly see-through in the
   game's art, like a curtain or a handle) win those ties outright. The game's object order changes from frame to frame and sometimes puts a
   piece in front before the one behind it, and an edge pixel drawn then blended with
@@ -102,8 +104,9 @@ time spent hashing uploads, waiting for replacement files to be read and allocat
 how many twins are shown, kept and idle.
 
 **F7** (or a `bench.now` file) benchmarks the next 600 frames (about 10 s): frame time
-average, p50/p95/p99 and worst, and the proxy's share per frame (draw hooks, uploads,
-submit), with the HD/xBR settings. The summary goes to the log and is appended to
+average, p50/p95/p99 and worst, the screen-sized passes with a depth attachment on the GPU
+(timestamps: the frame times wait for vsync and cannot show it), and the proxy's share per
+frame (draw hooks, uploads, submit), with the HD/xBR/world settings. The summary goes to the log and is appended to
 `bench.log` in the output folder, so versions and settings can be compared on the same
 scene (e.g. once with F9 HD on, once off).
 

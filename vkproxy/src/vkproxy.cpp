@@ -185,8 +185,23 @@ struct Bench {
     std::vector<double> frames;  // ms between presents
     double draws_ms = 0, uploads_ms = 0, submit_ms = 0;
     unsigned draws = 0, hd_draws = 0, xbr_draws = 0;
+    double gpu_ms = 0;  // the screen-sized passes on the GPU (see GpuTimer)
+    unsigned gpu_frames = 0, gpu_passes = 0;
 };
 Bench g_bench_acc;
+// The frame times are the CPU's and wait for vsync, so while benchmarking the screen-sized
+// passes with a depth attachment (the lot and what is drawn over it) are timed on the GPU too:
+// timestamps around each (up to kPasses recorded after a present), read back a few frames later.
+struct GpuTimer {
+    static const uint32_t kSlots = 8;   // frames in flight
+    static const uint32_t kPasses = 4;  // per frame, two timestamps each
+    VkQueryPool pool = VK_NULL_HANDLE;
+    double ns_per_tick = 1;
+    unsigned frame[kSlots] = {};  // the frame a slot was written in
+    uint32_t used[kSlots] = {};   // passes timed in it
+    bool pending[kSlots] = {};
+    bool failed = false;
+} g_gpu;
 
 void logf(const char* fmt, ...) {
     if (!g_log) return;
@@ -312,6 +327,7 @@ struct Deferred {
     uint64_t game_pipeline = 0;              // the game's (for its vertex layout)
     uint32_t depth_location = 3;             // vertex attribute with (nearest, farthest) depth
     float key = 0;                           // objects: the farthest depth of its vertices
+    bool keyed = false;                      // key already read (object_rank)
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;  // the pipeline's: sets and push constants go with it
     uint32_t sets = 0;                         // how many of set[] its shader uses
@@ -355,6 +371,8 @@ struct CmdState {
     uint64_t band = 0;                     // object_rank: the depth band being drawn
     bool band_open = false;
     std::unordered_set<uint64_t> closed_bands;  // and those drawn before it in this pass
+    float draw_far = -1;                   // the farthest depth of this draw's sprite, when object_rank read it
+    int gpu_slot = -1;                     // the pass is being timed (GpuTimer)
 };
 
 std::unordered_map<uint64_t, ImageInfo> g_images;           // VkImage
@@ -1052,11 +1070,15 @@ void apply_dynamic_state(VkCommandBuffer cb, const CmdState& st, int s) {
     }
 }
 
+int gpu_time_begin(VkCommandBuffer cb);
+void gpu_time_mark(VkCommandBuffer cb, int pair, bool end);
+
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi,
                                                     VkSubpassContents sc) {
     std::vector<uint64_t> targets;
     int scale = 1;
     uint32_t fb_w = 0, fb_h = 0;
+    bool depth = false;  // the framebuffer has a depth attachment
     {
         std::lock_guard<std::recursive_mutex> lk(g_mu);
         auto fb = g_fbs.find((uint64_t)bi->framebuffer);
@@ -1065,6 +1087,11 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkR
             scale = fb->second.scale;
             fb_w = fb->second.w * scale;
             fb_h = fb->second.h * scale;
+            for (auto v : targets) {
+                auto im = g_view_image.find(v);
+                auto info = im == g_view_image.end() ? g_images.end() : g_images.find(im->second);
+                depth |= info != g_images.end() && (info->second.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+            }
         }
     }
     begin_pass(cb, bi->renderArea.extent.width, bi->renderArea.extent.height, targets,
@@ -1083,9 +1110,13 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkR
             r.extent.height = oy < fb_h ? fb_h - oy : 0;
         }
     }
+    // timed while benchmarking (the queries are reset before the pass)
+    int gpu_pair = depth && fb_w == g_swap_w && fb_h == g_swap_h ? gpu_time_begin(cb) : -1;
     real_vkCmdBeginRenderPass(cb, &big, sc);
+    if (gpu_pair >= 0) gpu_time_mark(cb, gpu_pair, false);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     CmdState& st = g_cmd[cb];
+    st.gpu_slot = gpu_pair;
     st.scale = scale;
     st.area = big.renderArea;
     st.in_pass = true;
@@ -1387,6 +1418,10 @@ void defer_partial(VkCommandBuffer cb, const HdBind& hb, const DrawArgs& args) {
     d.args = args;
     d.viewports = st.viewports;
     d.scissors = st.scissors;
+    if (kind->second != kWorldFloor && st.draw_far >= 0) {  // read once already (the game's vertex buffers are slow to read)
+        d.key = st.draw_far;
+        d.keyed = true;
+    }
     (kind->second == kWorldFloor && !top ? st.deferred_floor : st.deferred).push_back(std::move(d));
 }
 
@@ -1472,12 +1507,18 @@ bool far_depth(const Deferred& d, float* out) {
 // objects at the very same depth then swapped which one showed (a curtain and the window behind
 // it). A draw whose band came and went earlier in the pass is such a moved one: it keeps the
 // rank it had in order, or, never seen in order, wins its ties as in the game, and is not kept.
+// A draw is known by its texture and position in the band, or, failing that, by its texture and
+// how many draws of it came before it in the band: scrolling moves every draw on the screen
+// each frame, and with no ranks known the partly covered pixels repeated at the end of the pass
+// won every tie (a window jamb's edge over the sash, flickering while the view scrolled).
 const uint32_t kMaxRank = 60;
 struct RankBook {
-    std::unordered_map<uint64_t, std::vector<uint64_t>> last;  // band -> its draws in rank order, as kept
-    // band -> this frame's (rank, arrival, draw); a draw not kept yet takes the rank of the draw
-    // before it in the band and then sorts after it (by arrival)
-    std::unordered_map<uint64_t, std::vector<std::tuple<uint32_t, uint32_t, uint64_t>>> now;
+    // band -> its draws in rank order, as kept: (by position, by count)
+    std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> last;
+    // band -> this frame's (rank, arrival, draw by position, by count); a draw not kept yet takes
+    // the rank of the draw before it in the band and then sorts after it (by arrival)
+    std::unordered_map<uint64_t, std::vector<std::tuple<uint32_t, uint32_t, uint64_t, uint64_t>>> now;
+    std::unordered_map<uint64_t, uint32_t> seen;  // band and texture -> its draws so far this frame
 } g_ranks;
 
 // At present: this frame's order (draws seen in order, and kept ones seen moved) is kept.
@@ -1486,9 +1527,10 @@ void commit_ranks() {
     for (auto& [band, v] : g_ranks.now) {
         std::sort(v.begin(), v.end());
         auto& ids = g_ranks.last[band];
-        for (auto& e : v) ids.push_back(std::get<2>(e));
+        for (auto& e : v) ids.emplace_back(std::get<2>(e), std::get<3>(e));
     }
     g_ranks.now.clear();
+    g_ranks.seen.clear();
 }
 
 uint64_t mix64(uint64_t h, uint64_t v) {
@@ -1499,6 +1541,7 @@ uint64_t mix64(uint64_t h, uint64_t v) {
 uint32_t object_rank(VkCommandBuffer cb, const DrawArgs& a) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     CmdState& st = g_cmd[cb];
+    st.draw_far = -1;
     if (!st.in_pass || !g_world_on || a.first_instance != 0 || a.instances != 1 || !a.count) return 0;
     if (!g_world_ranked.count(st.pipeline)) return 0;
     auto twin = g_world_twin.find(st.pipeline);
@@ -1512,6 +1555,7 @@ uint32_t object_rank(VkCommandBuffer cb, const DrawArgs& a) {
     d.args = a;
     float z[2], pos[3];
     if (!vertex_depths(d, 0, z) || !vertex_floats(d, 0, 0, VK_FORMAT_R32G32B32_SFLOAT, pos, 3)) return 0;
+    st.draw_far = z[1];  // a sprite's vertices all have the same depths: its key in flush_partial
     uint32_t zb[2], pb[3];
     memcpy(zb, z, sizeof zb);
     memcpy(pb, pos, sizeof pb);
@@ -1522,7 +1566,9 @@ uint32_t object_rank(VkCommandBuffer cb, const DrawArgs& a) {
         auto v = g_view_image.find(set->second[0].view);
         if (v != g_view_image.end()) texture = v->second;
     }
-    uint64_t id = mix64(mix64(mix64(mix64(band, texture), pb[0]), pb[1]), pb[2]);
+    uint64_t kind = mix64(band, texture);
+    uint64_t id = mix64(mix64(mix64(kind, pb[0]), pb[1]), pb[2]);
+    uint64_t nth = mix64(kind, 0x100000000ull + g_ranks.seen[kind]++);
     // moved: its band came and went earlier in this pass
     bool moved = false;
     if (!st.band_open || st.band != band) {
@@ -1537,15 +1583,17 @@ uint32_t object_rank(VkCommandBuffer cb, const DrawArgs& a) {
     int known = -1;
     auto last = g_ranks.last.find(band);
     if (last != g_ranks.last.end()) {
-        auto at = std::find(last->second.begin(), last->second.end(), id);
-        if (at != last->second.end()) known = static_cast<int>(at - last->second.begin());
+        auto& v = last->second;
+        auto at = std::find_if(v.begin(), v.end(), [&](const auto& e) { return e.first == id; });
+        if (at == v.end()) at = std::find_if(v.begin(), v.end(), [&](const auto& e) { return e.second == nth; });
+        if (at != v.end()) known = static_cast<int>(at - v.begin());
     }
     // mostly see-through sprites (a curtain over a window, a handle) win the ties outright
     uint32_t lead = g_translucent_images.count(texture) ? kMaxRank + 1 : 0;
     if (known < 0 && moved) return kMaxRank + lead;
     auto& now = g_ranks.now[band];
     uint32_t rank = known >= 0 ? static_cast<uint32_t>(known) : now.empty() ? 0 : std::get<0>(now.back());
-    now.emplace_back(rank, static_cast<uint32_t>(now.size()), id);
+    now.emplace_back(rank, static_cast<uint32_t>(now.size()), id, nth);
     return std::min(rank, kMaxRank) + lead;
 }
 
@@ -1560,7 +1608,7 @@ void flush_partial(VkCommandBuffer cb, bool floors) {
     if (list.empty()) return;
     if (!floors) {
         bool keyed = true;
-        for (auto& d : list) keyed = keyed && far_depth(d, &d.key);
+        for (auto& d : list) keyed = keyed && (d.keyed || far_depth(d, &d.key));
         if (keyed) {
             std::stable_sort(list.begin(), list.end(), [](const Deferred& a, const Deferred& b) {
                 return a.key != b.key ? a.key > b.key : a.args.first_instance < b.args.first_instance;  // then by rank
@@ -2017,6 +2065,72 @@ void dump_upload(VkBuffer src, VkImage dst, uint32_t n, const VkBufferImageCopy*
 }
 
 PFN_vkVoidFunction device_fn(const char* name) { return real_GDPA(g_device, name); }
+
+// While benchmarking: the next timestamp pair of this frame's GPU timer slot, its queries reset in
+// cb (outside the pass); -1 when there is none.
+int gpu_time_begin(VkCommandBuffer cb) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    if (!g_bench || g_gpu.failed) return -1;
+    static auto reset = reinterpret_cast<PFN_vkCmdResetQueryPool>(device_fn("vkCmdResetQueryPool"));
+    if (!g_gpu.pool) {
+        auto create = reinterpret_cast<PFN_vkCreateQueryPool>(device_fn("vkCreateQueryPool"));
+        auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            real_GIPA(g_instance, "vkGetPhysicalDeviceProperties"));
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * GpuTimer::kSlots * GpuTimer::kPasses;
+        if (!create || !props || !reset || create(g_device, &qi, nullptr, &g_gpu.pool) != VK_SUCCESS) {
+            g_gpu.pool = VK_NULL_HANDLE;
+            g_gpu.failed = true;
+            logf("benchmark: no GPU timer");
+            return -1;
+        }
+        VkPhysicalDeviceProperties p;
+        props(g_phys, &p);
+        g_gpu.ns_per_tick = p.limits.timestampPeriod;
+    }
+    uint32_t slot = g_frame % GpuTimer::kSlots;
+    if (g_gpu.frame[slot] != g_frame || !g_gpu.pending[slot]) {
+        if (g_gpu.pending[slot]) return -1;  // an older frame's, not read yet
+        g_gpu.pending[slot] = true;
+        g_gpu.frame[slot] = g_frame;
+        g_gpu.used[slot] = 0;
+    }
+    if (g_gpu.used[slot] == GpuTimer::kPasses) return -1;
+    int pair = static_cast<int>(slot * GpuTimer::kPasses + g_gpu.used[slot]++);
+    reset(cb, g_gpu.pool, 2 * pair, 2);
+    return pair;
+}
+
+void gpu_time_mark(VkCommandBuffer cb, int pair, bool end) {
+    static auto write = reinterpret_cast<PFN_vkCmdWriteTimestamp>(device_fn("vkCmdWriteTimestamp"));
+    if (write)
+        write(cb, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_gpu.pool,
+              2 * pair + (end ? 1 : 0));
+}
+
+// At present: the timed passes of frames a few frames old, into the benchmark.
+void gpu_time_collect() {
+    static auto results = reinterpret_cast<PFN_vkGetQueryPoolResults>(device_fn("vkGetQueryPoolResults"));
+    if (!g_gpu.pool || !results) return;
+    for (uint32_t s = 0; s < GpuTimer::kSlots; ++s) {
+        if (!g_gpu.pending[s] || g_frame < g_gpu.frame[s] + 3) continue;
+        uint64_t t[2 * GpuTimer::kPasses];
+        uint32_t n = g_gpu.used[s];
+        VkResult r = n ? results(g_device, g_gpu.pool, 2 * s * GpuTimer::kPasses, 2 * n, sizeof(uint64_t) * 2 * n, t,
+                                 sizeof(uint64_t), VK_QUERY_RESULT_64_BIT)
+                       : VK_SUCCESS;
+        if (r == VK_NOT_READY && g_frame < g_gpu.frame[s] + GpuTimer::kSlots) continue;
+        g_gpu.pending[s] = false;
+        if (r != VK_SUCCESS || !n || !g_bench) continue;
+        double ms = 0;
+        for (uint32_t k = 0; k < n; ++k)
+            if (t[2 * k + 1] > t[2 * k]) ms += (t[2 * k + 1] - t[2 * k]) * g_gpu.ns_per_tick / 1e6;
+        g_bench_acc.gpu_ms += ms;
+        ++g_bench_acc.gpu_frames;
+        g_bench_acc.gpu_passes += n;
+    }
+}
 
 // First memory type allowed by `bits` that has all of `want`, or UINT32_MAX.
 uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
@@ -3357,6 +3471,15 @@ VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCall
             if (m && destroy_module) destroy_module(d, m, nullptr);
             m = VK_NULL_HANDLE;
         }
+        if (g_world_vert_module && destroy_module) destroy_module(d, g_world_vert_module, nullptr);
+        g_world_vert_module = VK_NULL_HANDLE;
+        auto destroy_sampler = reinterpret_cast<PFN_vkDestroySampler>(device_fn("vkDestroySampler"));
+        for (auto& s : g_mip_samplers)  // ours (or the game's own where ours could not be made)
+            if (destroy_sampler && (uint64_t)s.second != s.first) destroy_sampler(d, s.second, nullptr);
+        g_mip_samplers.clear();
+        auto destroy_queries = reinterpret_cast<PFN_vkDestroyQueryPool>(device_fn("vkDestroyQueryPool"));
+        if (g_gpu.pool && destroy_queries) destroy_queries(d, g_gpu.pool, nullptr);
+        g_gpu = GpuTimer{};
         g_device = VK_NULL_HANDLE;
     }
     real_vkDestroyDevice(d, a);
@@ -3390,12 +3513,19 @@ VKAPI_ATTR void VKAPI_CALL hk_vkCmdNextSubpass(VkCommandBuffer cb, VkSubpassCont
 VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderPass(VkCommandBuffer cb) {
     flush_partial(cb, true);
     flush_partial(cb, false);
+    int gpu_pair;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        gpu_pair = g_cmd[cb].gpu_slot;
+    }
+    if (gpu_pair >= 0) gpu_time_mark(cb, gpu_pair, true);
     real_vkCmdEndRenderPass(cb);
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     CmdState& st = g_cmd[cb];
     if (g_trace || st.log_pass) logf("  [end]");
     st.log_pass = false;
     st.in_pass = false;
+    st.gpu_slot = -1;
     if (st.scale > 1) {
         st.scale = 1;
         apply_dynamic_state(cb, st, 1);  // later passes expect the game's values
@@ -3513,10 +3643,15 @@ void write_world_draws(VkCommandBuffer cb) {
 }
 
 // The repeated object draws were sorted by vertex depths read while recording; the game might
-// write its vertices later. Read them again now, when they are final, and log any change.
+// write its vertices later. Read them again now, when they are final, and log any change: once
+// every 600 frames (none seen so far, and reading the game's vertex buffers is slow).
 void check_sorted(VkCommandBuffer cb) {
     auto it = g_cmd.find(cb);
     if (it == g_cmd.end() || it->second.sorted.empty()) return;
+    if (g_frame % 600) {
+        it->second.sorted.clear();
+        return;
+    }
     static unsigned checked = 0, changed = 0, logged = 0;
     for (auto& d : it->second.sorted) {
         float k;
@@ -3566,14 +3701,15 @@ void write_bench() {
     auto pct = [&](double p) { return n ? f[std::min(n - 1, static_cast<size_t>(p * n))] : 0.0; };
     char line[512];
     snprintf(line, sizeof line,
-             "%u frames, avg %.2f ms (%.1f fps), p50 %.2f, p95 %.2f, p99 %.2f, max %.1f; proxy per frame: "
-             "draws %.3f ms (%.0f draws, %.0f HD, %.0f xBR), uploads %.3f ms, submit %.3f ms; hd=%d xbr=%d scale=%d "
-             "%ux%u, %u HD twins shown",
+             "%u frames, avg %.2f ms (%.1f fps), p50 %.2f, p95 %.2f, p99 %.2f, max %.1f; screen passes on the GPU "
+             "%.3f ms (%.1f per frame, %u frames timed); proxy per frame: draws %.3f ms (%.0f draws, %.0f HD, %.0f "
+             "xBR), uploads %.3f ms, submit %.3f ms; hd=%d xbr=%d world=%d scale=%d %ux%u, %u HD twins shown",
              static_cast<unsigned>(n), n ? total / n : 0, n ? 1000.0 * n / total : 0, pct(0.5), pct(0.95), pct(0.99),
-             n ? f.back() : 0, b.draws_ms / b.frames.size(), 1.0 * b.draws / b.frames.size(),
-             1.0 * b.hd_draws / b.frames.size(), 1.0 * b.xbr_draws / b.frames.size(), b.uploads_ms / b.frames.size(),
-             b.submit_ms / b.frames.size(), g_hd_on, g_xbr_on, g_layer_scale, g_swap_w, g_swap_h,
-             static_cast<unsigned>(g_hd.size()));
+             n ? f.back() : 0, b.gpu_frames ? b.gpu_ms / b.gpu_frames : 0.0,
+             b.gpu_frames ? 1.0 * b.gpu_passes / b.gpu_frames : 0.0, b.gpu_frames, b.draws_ms / b.frames.size(),
+             1.0 * b.draws / b.frames.size(), 1.0 * b.hd_draws / b.frames.size(), 1.0 * b.xbr_draws / b.frames.size(),
+             b.uploads_ms / b.frames.size(), b.submit_ms / b.frames.size(), g_hd_on, g_xbr_on, g_world_on,
+             g_layer_scale, g_swap_w, g_swap_h, static_cast<unsigned>(g_hd.size()));
     logf("== benchmark: %s", line);
     if (FILE* out = fopen((g_dir + "\\bench.log").c_str(), "a")) {
         SYSTEMTIME t;
@@ -3604,6 +3740,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentIn
              static_cast<unsigned>(g_twins.size()), g_idle_count, g_idle_bytes / 1048576.0,
              static_cast<unsigned>(g_staging_retire.size()));
     }
+    gpu_time_collect();
     if (g_bench) {
         g_bench_acc.frames.push_back(frame_ms);
         g_bench_acc.uploads_ms += g_perf.copy;
